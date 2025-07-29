@@ -11,9 +11,9 @@ cpdef tuple ale_1d_fast(object f, np.ndarray X, int feature_idx, int bins=10):
     cdef int n = x.shape[0]
     cdef np.ndarray[np.double_t, ndim=1] edges = np.quantile(x, np.linspace(0, 1, bins + 1))
     edges[0] = x.min()
-    edges[-1] = x.max() + np.finfo(np.float16).eps
+    edges[bins] = x.max() + 10 ** -10  # Use a small epsilon to avoid numerical issues
 
-    cdef np.ndarray[np.int_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
     cdef np.ndarray[np.int64_t, ndim=1] N_k = np.zeros(bins, dtype=np.int64)
     cdef int i
     for i in range(n):
@@ -47,7 +47,7 @@ cpdef double ale_global_main_fast(np.ndarray edges, np.ndarray curve, np.ndarray
     cdef np.ndarray[np.double_t, ndim=1] x = X[:, idx]
     cdef int n = x.shape[0]
     cdef int bins = edges.shape[0] - 1
-    cdef np.ndarray[np.int_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
     cdef double result = 0.0
     cdef int i
     for i in range(n):
@@ -66,12 +66,12 @@ cpdef tuple ale_2d_fast(object f, np.ndarray X, int feature_idx_1, int feature_i
     cdef np.ndarray[np.double_t, ndim=1] edges_1 = np.quantile(x1, np.linspace(0, 1, bins + 1))
     cdef np.ndarray[np.double_t, ndim=1] edges_2 = np.quantile(x2, np.linspace(0, 1, bins + 1))
     edges_1[0] = x1.min()
-    edges_1[-1] = x1.max()
+    edges_1[bins] = x1.max() + 10 ** -10  # Use a small epsilon to avoid numerical issues
     edges_2[0] = x2.min()
-    edges_2[-1] = x2.max()
+    edges_2[bins] = x2.max() + 10 ** -10  # Use a small epsilon to avoid numerical issues
 
-    cdef np.ndarray[np.int_t, ndim=1] k_x = np.clip(np.searchsorted(edges_1, x1, side='right'), 1, bins)
-    cdef np.ndarray[np.int_t, ndim=1] m_x = np.clip(np.searchsorted(edges_2, x2, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] k_x = np.clip(np.searchsorted(edges_1, x1, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] m_x = np.clip(np.searchsorted(edges_2, x2, side='right'), 1, bins)
 
     cdef np.ndarray[np.int64_t, ndim=2] N_km = np.zeros((bins, bins), dtype=np.int64)
     cdef int i, k, m
@@ -140,6 +140,7 @@ cpdef tuple generate_connected_paths_2d_fast(np.ndarray X, int feature_idx, np.n
     cdef np.ndarray mask
     cdef np.ndarray original_idx
     cdef np.ndarray idxs
+
     for i in range(K):
         mask = (x_j >= edges[i]) & (x_j < edges[i+1])
         original_idx = np.where(mask)[0]
@@ -160,9 +161,9 @@ cpdef double ale_quantile_total_fast(object f, np.ndarray X, int feature_idx, in
 
     cdef np.ndarray[np.double_t, ndim=1] edges = np.quantile(x, np.linspace(0,1,bins+1))
     edges[0] = x.min()
-    edges[-1] = x.max() + np.finfo(np.float16).eps
+    edges[bins] = x.max() + 10 ** -10  # Use a small epsilon to avoid numerical issues
 
-    cdef np.ndarray[np.int_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
     cdef int k_bar = int(np.clip(np.searchsorted(edges, x.mean(), side='right'), 1, bins))
 
     cdef np.ndarray[np.int64_t, ndim=1] N_k = np.zeros(bins, dtype=np.int64)
@@ -221,9 +222,9 @@ cpdef double ale_connected_total_fast(object f, np.ndarray X, int feature_idx, i
 
     cdef np.ndarray[np.double_t, ndim=1] edges = np.quantile(x, np.linspace(0,1,bins+1))
     edges[0] = x.min()
-    edges[-1] = x.max() + np.finfo(np.float16).eps
+    edges[bins] = x.max() + 10 ** -10  # Use a small epsilon to avoid numerical issues
 
-    cdef np.ndarray[np.int_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
     cdef int k_bar = int(np.clip(np.searchsorted(edges, x.mean(), side='right'), 1, bins))
 
     cdef np.ndarray[np.int64_t, ndim=1] N_k = np.zeros(bins, dtype=np.int64)
@@ -280,9 +281,9 @@ cpdef double ale_connected_modified_total_fast(object f, np.ndarray X, int featu
 
     cdef np.ndarray[np.double_t, ndim=1] edges = np.quantile(x, np.linspace(0,1,bins+1))
     edges[0] = x.min()
-    edges[-1] = x.max() + np.finfo(np.float16).eps
+    edges[bins] = x.max() + 10 ** -10  # Use a small epsilon to avoid numerical issues
 
-    cdef np.ndarray[np.int_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
+    cdef np.ndarray[np.int64_t, ndim=1] k_x = np.clip(np.searchsorted(edges, x, side='right'), 1, bins)
     cdef int k_bar = int(np.clip(np.searchsorted(edges, x.mean(), side='right'), 1, bins))
 
     cdef np.ndarray[np.int64_t, ndim=1] N_k = np.zeros(bins, dtype=np.int64)

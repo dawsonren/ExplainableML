@@ -14,5 +14,4 @@ pip install cython numpy
 python setup.py build_ext --inplace
 ```
 
-The build is optional. If the compiled module is unavailable, the
-notebook will automatically fall back to the pure Python implementation.
+Make sure to drag the `.so` output into `algorithms` after compilation.
