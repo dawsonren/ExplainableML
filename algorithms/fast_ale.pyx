@@ -248,8 +248,8 @@ cpdef double ale_connected_total_fast(object f, np.ndarray X, int feature_idx, i
             i = indices[l, m]
             X_left = np.zeros_like(X[i,:])
             X_right = np.zeros_like(X[i,:])
-            X_left[idx] = edges[k_bar-1]
-            X_right[idx] = edges[k_bar]
+            X_left[idx] = edges[m]
+            X_right[idx] = edges[m+1]
             X_left[1-idx] = x_other
             X_right[1-idx] = x_other
             g_values[l, m] = f(X_right) - f(X_left)
