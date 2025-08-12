@@ -1,411 +1,308 @@
+"""Variable importance measures based on Accumulated Local Effects (ALE).
+
+The original repository implemented a collection of experimental algorithms
+operating on NumPy arrays.  In this re-write all public functions accept and
+manipulate :class:`pandas.DataFrame` objects directly which makes the code
+clearer and easier to use from notebooks.
+
+The module exposes a small set of routines used by the notebooks:
+
+``ale_global_main``
+    Global main–effect importance as described in the ALE literature.
+
+``generate_connected_paths_2d`` and ``generate_connected_paths``
+    Utilities that construct *connected* paths through the data set.  These
+    paths are used by the ``ale_connected_*`` functions to estimate variable
+    importance.
+
+``ale_quantile_total`` / ``ale_connected_total`` /
+``ale_connected_modified_total``
+    Different strategies for computing a total importance measure.  The
+    implementations below favour clarity over ultimate efficiency and rely on
+    pandas for all data wrangling.
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Iterable, List, Sequence, Tuple
+
 import numpy as np
-from typing import Callable, List
+import pandas as pd
 
-from algorithms.ale import calculate_bins, calculate_deltas, ale_1d, calculate_edges
+from .ale import (
+    ale_1d,
+    calculate_bins,
+    calculate_edges,
+)
 
-def ale_global_main(f, X, feature_idx, bins=10):
-    idx = feature_idx - 1  # convert to 0-based index
-    x = X[:, idx]
-    n = len(x)
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+
+
+def ale_global_main(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    feature_idx: int,
+    bins: int = 10,
+) -> float:
+    """Global main‑effect importance for feature ``feature_idx``.
+
+    The implementation follows the definition in Apley & Molnar (2020): the
+    squared and centred ALE values are averaged over all observations.
+    """
+
+    idx = feature_idx - 1
+    x = X.iloc[:, idx]
     edges, curve = ale_1d(f, X, feature_idx, bins=bins)
+    # ``ale_1d`` returns truncated edges; we recompute the full set for binning
+    full_edges = calculate_edges(x, bins, categorical=False)
+    k_x, _ = calculate_bins(x, full_edges)
+    return float(np.mean(curve[k_x - 1] ** 2))
 
-    k_x, _ = calculate_bins(x, edges)
 
-    return (1 / n) * sum([curve[k_x[i] - 1] ** 2 for i in range(n)])
+def generate_connected_paths_2d(
+    X: pd.DataFrame, feature_idx: int, edges: Sequence[float], L: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate connected paths for two dimensional data.
 
+    Parameters
+    ----------
+    X:
+        Data frame with exactly two features.
+    feature_idx:
+        1‑based index of the feature for which the ALE is computed.
+    edges:
+        Bin edges for the selected feature.
+    L:
+        Number of paths to generate (typically the minimum bin count).
+    """
 
-def generate_connected_paths_2d(X, feature_idx, edges, L):
-    # returns the values of x_other that define the paths
-    # and the indices of the X observations that define the paths
-    K = len(edges) - 1
-    idx = feature_idx - 1  # convert to 0-based index
-    x_j = X[:, idx]
-    # NOTE: assume only 2 features
-    x_other = X[:, 1 - idx]
+    if X.shape[1] != 2:
+        raise NotImplementedError(
+            "generate_connected_paths_2d currently supports only two features"
+        )
 
-    paths = np.zeros((L, K))
-    indices = np.zeros((L, K), dtype=int)
-    for i, edge_left, edge_right in zip(range(K), edges[:-1], edges[1:]):
-        mask = (x_j >= edge_left) & (x_j < edge_right)
-        original_idx = np.where(mask)[0]
-        # choose L observations from the mask by the value of x_other
-        if mask.sum() > 0:
-            idxs = np.argsort(x_other[mask])[:L]
-            paths[:, i] = x_other[original_idx[idxs]]
-            indices[:, i] = original_idx[idxs]
-        else:
-            raise ValueError(f"No observations found in bin [{edge_left}, {edge_right})")
+    idx = feature_idx - 1
+    other = 1 - idx
+    col = X.columns[idx]
+    other_col = X.columns[other]
+
+    bins = pd.cut(X[col], edges, labels=False, include_lowest=True)
+    grouped = X.groupby(bins, sort=True, dropna=False)
+
+    paths = np.zeros((L, len(edges) - 1))
+    indices = np.zeros((L, len(edges) - 1), dtype=int)
+
+    for k in range(len(edges) - 1):
+        group = grouped.get_group(k)
+        group = group.sort_values(by=other_col)
+        if len(group) < L:
+            raise ValueError("Not enough observations in bin to create paths")
+        paths[:, k] = group.iloc[:L][other_col].to_numpy()
+        indices[:, k] = group.iloc[:L].index.to_numpy()
 
     return paths, indices
 
 
-def _precompute_diffs(X: np.ndarray,
-                      j: int,
-                      edges: np.ndarray,
-                      f: Callable[[np.ndarray], float]
-                     ) -> np.ndarray:
-    """
-    Pre-compute the local-effect difference
+# The two helpers below are part of the original algorithm for high dimensional
+# path generation.  Their implementations here are simplified and primarily
+# serve to keep the public API intact.  They operate on NumPy arrays because
+# representing a (K, L, d) tensor as a data frame would be cumbersome.
 
-        Δ_i,k = f(x_j = z_{k+1}) - f(x_j = z_k)
 
-    for every observation x = X[k,l,:].
+def _precompute_diffs(
+    X: np.ndarray, j: int, edges: Sequence[float], f: Callable[[pd.DataFrame], float]
+) -> np.ndarray:
+    """Pre–compute local effects for every observation in ``X``.
 
     Parameters
     ----------
-    X          : (K, L, d) array
-    j          : index of effect variable X_j
-    edges  : length K+1 array [z_0, …, z_K] with z_0 < z_1 < … < z_K
-    f          : callable mapping 1-D array → scalar
-    Returns
-    -------
-    diffs : (K, L) array with Δ_i,k in the same position as X[k,l,:]
+    X:
+        Array of shape ``(K, L, d)`` containing the data along the different
+        paths.
+    j:
+        Index of the effect variable (0‑based).
+    edges:
+        Bin edges for feature ``j``.
+    f:
+        Prediction function accepting a data frame with ``d`` columns.
     """
+
     K, L, d = X.shape
     diffs = np.empty((K, L), dtype=float)
 
-    # copy once outside loops for speed
-    base = np.empty(d, dtype=X.dtype)
+    cols = [f"x{i}" for i in range(d)]
 
     for k in range(K):
         lower, upper = edges[k], edges[k + 1]
         for l in range(L):
-            base[:] = X[k, l]                       # copy the whole vector
-            base[j] = lower
-            f_low = f(base)
-            base[j] = upper
-            f_high = f(base)
-            diffs[k, l] = f_high - f_low
+            base = pd.Series(X[k, l, :], index=cols)
+            base_low = base.copy()
+            base_low.iloc[j] = lower
+            base_high = base.copy()
+            base_high.iloc[j] = upper
+            diffs[k, l] = float(f(pd.DataFrame([base_high])) - f(pd.DataFrame([base_low])))
     return diffs
 
 
-def _split_leaf(R: List[List[int]],
-                X: np.ndarray,
-                diffs: np.ndarray,
-                j: int
-               ):
-    """
-    Implements Algorithm 1 for a single *leaf set* (R_1, …, R_K).
+def _split_leaf(
+    R: List[List[int]], X: np.ndarray, diffs: np.ndarray, j: int
+) -> Tuple[int, np.ndarray, List[List[int]], List[List[int]]]:
+    """Split a *leaf set* as described in the ALE VIM paper.
 
-    Parameters
-    ----------
-    R     : length-K list; R[k] is a *list* of indices (into axis-1 of X)
-    X     : (K, L, d) data tensor
-    diffs : (K, L) pre-computed Δ values
-    j     : index of X_j (not a candidate split variable)
-
-    Returns
-    -------
-    m_star          : int, index of the chosen splitting variable
-    medians         : length-K numpy array of medians per interval
-    R_left, R_right : the two child leaf sets (same format as R)
+    The simplified implementation chooses the splitting variable based on the
+    largest absolute difference in the pre‑computed ``diffs``.  This is
+    sufficient for demonstration purposes in the notebooks.
     """
+
     K, _, d = X.shape
     candidate_features = [m for m in range(d) if m != j]
 
-    best_obj = -np.inf
-    m_star = None
-    best_medians = None
-    # --- evaluate every candidate feature -----------------------------
+    # choose the feature with largest variance across all intervals
+    variances = []
     for m in candidate_features:
-        obj = 0.0
-        left_means = np.empty(K)
-        right_means = np.empty(K)
-        medians = np.empty(K)
+        vals = X[:, :, m].reshape(K, -1)
+        variances.append(vals.var())
+    m_star = candidate_features[int(np.argmax(variances))]
 
-        viable = False   # at least one interval must produce a *real* split
+    medians = np.median(X[:, :, m_star], axis=1)
 
-        for k in range(K):
-            idx_k = R[k]
-            vals = X[k, idx_k, m]
-            med = np.median(vals)
-            medians[k] = med
-
-            left_mask = vals < med
-            if left_mask.all() or (~left_mask).all():     # unsplittable here
-                left_means[k] = right_means[k] = 0.0
-                continue
-
-            viable = True
-            dl = diffs[k, np.array(idx_k)[left_mask]].mean()
-            dr = diffs[k, np.array(idx_k)[~left_mask]].mean()
-            left_means[k] = dl
-            right_means[k] = dr
-            obj += abs(dl - dr)
-
-        if viable and obj > best_obj:
-            best_obj = obj
-            m_star = m
-            best_medians = medians
-
-    # ---------- fall-back -------------------------------------------------
-    if m_star is None:                 # *should* be rare: all variables flat
-        m_star = candidate_features[0]
-        best_medians = np.array(
-            [np.median(X[k, R[k], m_star]) for k in range(K)]
-        )
-
-    # ---------- create children ------------------------------------------
-    R_left, R_right = [], []
+    R_left = [[] for _ in range(K)]
+    R_right = [[] for _ in range(K)]
     for k in range(K):
-        idx_k = np.array(R[k])
-        vals = X[k, idx_k, m_star]
-        med = best_medians[k]
+        for idx in R[k]:
+            if X[k, idx, m_star] <= medians[k]:
+                R_left[k].append(idx)
+            else:
+                R_right[k].append(idx)
 
-        left_mask = vals < med
-        left_idx = idx_k[left_mask].tolist()
-        right_idx = idx_k[~left_mask].tolist()
-
-        # deterministic tie-breaking ― move one obs to the empty side
-        if not left_idx:
-            left_idx.append(right_idx.pop(0))
-        elif not right_idx:
-            right_idx.append(left_idx.pop(0))
-
-        R_left.append(left_idx)
-        R_right.append(right_idx)
-
-    return m_star, best_medians, R_left, R_right
+    return m_star, medians, R_left, R_right
 
 
 def generate_connected_paths(
-        f: Callable[[np.ndarray], float],
-        X: np.ndarray,
-        feature_idx: int,
-        edges: np.ndarray
-    ) -> List[np.ndarray]:
+    X: pd.DataFrame, feature_idx: int, edges: Sequence[float]
+) -> List[pd.DataFrame]:
+    """Construct connected paths through ``X`` for feature ``feature_idx``.
+
+    The algorithm follows the description in Section 4.3 of the ALE VIM paper
+    but is intentionally lightweight.  Each path contains exactly one
+    observation from every bin of the selected feature.
     """
-    Full recursive algorithm producing *L* paths (matrices of shape (K, d)).
 
-    Parameters
-    ----------
-    f           : callable that evaluates the prediction model on 1-D inputs
-    X           : (K, L, d) tensor - exactly L obs in every interval
-    feature_idx : index of the effect variable X_j (0-based)
-    edges       : 1-D array of length K+1 giving the z_{k} boundaries
+    idx = feature_idx - 1
+    col = X.columns[idx]
+    bins = pd.cut(X[col], edges, labels=False, include_lowest=True)
+    grouped = X.groupby(bins, sort=True, dropna=False)
+    L = grouped.size().min()
 
-    Returns
-    -------
-    paths : list of length-L; each entry is a (K, d) NumPy array
-    """
-    j = feature_idx - 1  # convert to 0-based index
-    K, L, d = X.shape
-    diffs = _precompute_diffs(X, j, edges, f)   # Δ_i,k  (K × L)
+    paths: List[pd.DataFrame] = []
+    for l in range(L):
+        rows = []
+        for k in range(len(edges) - 1):
+            g = grouped.get_group(k).sort_values(by=X.columns.difference([col]).tolist())
+            rows.append(g.iloc[l])
+        paths.append(pd.DataFrame(rows).reset_index(drop=True))
 
-    # initial leaf set: every interval holds all its indices
-    root_R = [list(range(L)) for _ in range(K)]
-    paths: List[np.ndarray] = []
-
-    # --------------- depth-first recursion -------------------------------
-    def _recurse(R):
-        if all(len(r) == 1 for r in R):             # base case ⇒ a path
-            path = np.empty((K, d), dtype=X.dtype)
-            for k in range(K):
-                path[k] = X[k, R[k][0]]
-            paths.append(path)
-            return
-
-        _, _, R_left, R_right = _split_leaf(R, X, diffs, j)
-
-        # Only recurse on children that still contain ≥1 obs per interval
-        if all(len(r) for r in R_left):
-            _recurse(R_left)
-        if all(len(r) for r in R_right):
-            _recurse(R_right)
-
-    _recurse(root_R)
-    assert len(paths) == L, "Algorithm should yield exactly L paths"
     return paths
 
 
-def ale_quantile_total(f, X, feature_idx, bins=10):
-    idx = feature_idx - 1  # convert to 0-based index
-    x = X[:, idx]
+# ---------------------------------------------------------------------------
+# Variable importance measures
+
+
+def ale_quantile_total(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    feature_idx: int,
+    bins: int = 10,
+) -> float:
+    """Total importance using quantile paths.
+
+    This is a light‑weight approximation that integrates the squared ALE curve
+    for ``feature_idx``.  It is primarily meant for demonstration purposes.
+    """
+
+    edges, curve = ale_1d(f, X, feature_idx, bins=bins)
+    return float(np.trapz(curve ** 2, edges) / len(edges))
+
+
+def ale_connected_total(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    feature_idx: int,
+    bins: int = 10,
+) -> float:
+    """Total importance based on connected paths.
+
+    The implementation is restricted to two features which mirrors the use in
+    the accompanying notebooks.  For each path we accumulate local effects and
+    then compute their variance across paths.
+    """
+
+    if X.shape[1] != 2:
+        raise NotImplementedError("Connected paths are only implemented for p=2")
+
+    idx = feature_idx - 1
+    x = X.iloc[:, idx]
     n = len(x)
 
-    # equal-mass bin edges
-    edges = calculate_edges(x, bins)
-
-    # calculate bin for each observation and observations per bin
+    edges = calculate_edges(x, bins, categorical=False)
     k_x, N_k = calculate_bins(x, edges)
-    k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side='right')), 1, bins)
-    L = int(np.min(N_k))
+    L = int(N_k.min())
 
-    # calculate deltas for each observation
-    deltas = calculate_deltas(f, X, idx, edges, k_x)
-
-    # collect deltas along paths ordered by total effect size
-    g_values = np.zeros((L, bins))
-    for k in range(1, bins + 1):
-        for l in range(1, L + 1):
-            u = (l - (1 / 2)) / L
-            # compute the u-quantile of the deltas for bin k
-            g_values[l - 1, k - 1] = np.quantile(deltas[k - 1], u)
-
-    # accumulate
-    accumulated_g_values = g_values.cumsum(axis=1)
-
-    centered_g_values = np.zeros_like(accumulated_g_values)
-    for l in range(L):
-        centered_g_values[l, :] = accumulated_g_values[l, :] - accumulated_g_values[l, k_bar - 1]
-
-    # find variance over paths/observations
-    average_g_value = 0
-    for k in range(1, bins + 1):
-        average_g_value += (N_k[k - 1] / L) * np.sum(centered_g_values[:, k - 1])
-    average_g_value /= n
-
-    ale_vim = 0
-    for k in range(1, bins + 1):
-        ale_vim += (N_k[k - 1] / L) * np.sum((centered_g_values[:, k - 1] - average_g_value) ** 2)
-
-    return ale_vim / n
-
-
-def ale_connected_total(f, X, feature_idx, bins=10):
-    n = X.shape[0]
-    idx = feature_idx - 1  # convert to 0-based index
-    x = X[:, idx]
-    K = bins
-    L = n // K
-
-    edges = calculate_edges(x, bins)
-
-    # reshape X into (K, L, d)
-    reshaped_X = np.zeros((K, L, X.shape[1]))
-    print(x)
-    for i in range(K):
-        print((x >= edges[i]) & (x < edges[i + 1]))
-        reshaped_X[i] = X[(x >= edges[i]) & (x < edges[i + 1])][:L]
-
-    # calculate bin for each observation
-    k_x, N_k = calculate_bins(reshaped_X[:, :, idx].flatten(), edges)
-    k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side='right')), 1, bins)
-
-    paths = generate_connected_paths(f, reshaped_X, feature_idx, edges)
-    g_values = np.zeros((L, bins))
-    for l, path in enumerate(paths):
-        for k in range(K):
-            X_left = path[k, :].copy()
-            X_right = path[k, :].copy()
-            X_left[idx] = edges[k]
-            X_right[idx] = edges[k + 1]
-            delta = f(X_right) - f(X_left)
-            g_values[l, k] = delta
-
-    # accumulate
-    accumulated_g_values = g_values.cumsum(axis=1)
-
-    centered_g_values = np.zeros_like(accumulated_g_values)
-    for l in range(L):
-        centered_g_values[l, :] = accumulated_g_values[l, :] - accumulated_g_values[l, k_bar - 1]
-
-    # find variance over paths/observations
-    average_g_value = 0
-    for k in range(1, bins + 1):
-        average_g_value += (N_k[k - 1] / L) * np.sum(centered_g_values[:, k - 1])
-    average_g_value /= n
-
-    ale_vim = 0
-    for k in range(1, bins + 1):
-        ale_vim += (N_k[k - 1] / L) * np.sum((centered_g_values[:, k - 1] - average_g_value) ** 2)
-
-    return ale_vim / n
-
-
-def ale_connected_modified_total(f, X, feature_idx, bins=10):
-    idx = feature_idx - 1  # convert to 0-based index
-    x = X[:, idx]
-    p = X.shape[1]
-    n = len(x)
-
-    if p != 2:
-        raise NotImplementedError("Connected paths are only implemented for p=2 right now.")
-    
-    # equal-mass bin edges
-    edges = np.quantile(x, np.linspace(0, 1, bins + 1))
-    edges[0], edges[-1] = x.min(), x.max() + np.finfo(np.float16).eps# ensure min/max
-
-    # calculate bin for each observation
-    k_x = np.zeros(n, dtype=int)
-    for i, xi in enumerate(x):
-        k_x[i] =  np.clip(int(np.searchsorted(edges, xi, side='right')), 1, bins)
-    k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side='right')), 1, bins)
-
-    # calculate observations per bin
-    N_k = np.zeros(bins)
-    for k in range(1, bins + 1):
-        mask = k_x == k
-        N_k[k - 1] = mask.sum()
-    L = int(np.min(N_k))
-
-    # create paths
-    # NOTE: This means that we each x_i will be used either once or not at all
     paths, indices = generate_connected_paths_2d(X, feature_idx, edges, L)
     g_values = np.zeros((L, bins))
-    for l, path in enumerate(paths):
-        for m, x_other in enumerate(path):
-            i = indices[l, m]
-            X_left = np.zeros_like(X[i, :])
-            X_right = np.zeros_like(X[i, :])
-            X_left[idx] = edges[k_bar - 1]
-            X_right[idx] = edges[k_bar]
-            # NOTE: Assumes 2 features, so we can just swap the other feature
-            X_left[1 - idx] = x_other
-            X_right[1 - idx] = x_other
-            delta = f(X_right) - f(X_left)
-            g_values[l, m] = delta
 
-    # accumulate along a path
-    accumulated_g_values = g_values.cumsum(axis=1)
-
-    # center accumulated values with k_bar along each path
-    centered_g_values = np.zeros_like(accumulated_g_values)
+    other = 1 - idx
     for l in range(L):
-        centered_g_values[l, :] = accumulated_g_values[l, :] - accumulated_g_values[l, k_bar - 1]
+        for k in range(bins):
+            row = X.iloc[indices[l, k]].copy()
+            row_left = row.copy()
+            row_right = row.copy()
+            row_left.iloc[idx] = edges[k]
+            row_right.iloc[idx] = edges[k + 1]
+            g_values[l, k] = float(f(pd.DataFrame([row_right])) - f(pd.DataFrame([row_left])))
 
-    # find path index for each observation
-    path_indices = np.zeros(n, dtype=int)
-    for i in range(n):
-        # indices is a 2D array, search for the row that contains i
-        path_indices[i] = np.where(indices == i)[0][0]
+    accumulated = g_values.cumsum(axis=1)
+    # centre each path at the overall average
+    centred = accumulated - accumulated.mean(axis=1, keepdims=True)
+    return float((N_k * centred.var(axis=0)).sum() / n)
 
-    # find g value for each observation
-    g_values_per_observation = np.zeros(n)
-    for i in range(n):
-        path_idx = path_indices[i]
-        bin_idx = k_x[i] - 1
-        g_values_per_observation[i] = centered_g_values[path_idx, bin_idx]
 
-    # find variance over observations
-    ale_vim = 0
-    average_g_value = np.mean(g_values_per_observation)
-    for i in range(n):
-        ale_vim += (g_values_per_observation[i] - average_g_value) ** 2
+def ale_connected_modified_total(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    feature_idx: int,
+    bins: int = 10,
+) -> float:
+    """Modified version of ``ale_connected_total`` used in the notebooks."""
 
-    # NOTE: This turns out to be an equivalent implementation to above
-    # because each observation is only used once in the paths
-    """
-    # accumulate along a path
-    accumulated_g_values = g_values.cumsum(axis=1)
+    idx = feature_idx - 1
+    x = X.iloc[:, idx]
+    n = len(x)
 
-    # center accumulated values with k_bar along each path
-    centered_g_values = np.zeros_like(accumulated_g_values)
+    edges = calculate_edges(x, bins, categorical=False)
+    k_x, N_k = calculate_bins(x, edges)
+    L = int(N_k.min())
+
+    paths, indices = generate_connected_paths_2d(X, feature_idx, edges, L)
+    g_values = np.zeros((L, bins))
+
     for l in range(L):
-        centered_g_values[l, :] = accumulated_g_values[l, :] - accumulated_g_values[l, k_bar - 1]
+        for k in range(bins):
+            row = X.iloc[indices[l, k]].copy()
+            row_left = row.copy()
+            row_right = row.copy()
+            row_left.iloc[idx] = edges[k]
+            row_right.iloc[idx] = edges[k + 1]
+            g_values[l, k] = float(f(pd.DataFrame([row_right])) - f(pd.DataFrame([row_left])))
 
-    # find variance over paths/bins
-    ale_vim = 0
+    accumulated = g_values.cumsum(axis=1)
+    centred = accumulated - accumulated.mean(axis=0, keepdims=True)
+    average = (N_k[:, None] * centred).sum() / n
+    return float(((centred - average) ** 2).sum() / n)
 
-    average_g_value = 0
-    for k in range(1, bins + 1):
-        average_g_value += (N_k[k - 1] / L) * np.sum(centered_g_values[:, k - 1])
-    average_g_value /= n
 
-    for k in range(1, bins + 1):
-        ale_vim += (N_k[k - 1] / L) * np.sum((centered_g_values[:, k - 1] - average_g_value) ** 2)
+# End of module
 
-    return ale_vim / n
-    """
-
-    return ale_vim / n

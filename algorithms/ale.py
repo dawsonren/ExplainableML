@@ -1,209 +1,267 @@
+"""Accumulated Local Effects (ALE) utilities that operate on pandas data
+frames.
+
+The original implementation in this repository worked exclusively with
+NumPy arrays.  For the purposes of the exercises in this kata we re-write
+the helper functions so that a :class:`pandas.DataFrame` can be supplied
+directly.  Only basic NumPy functionality is used where convenient, but the
+data manipulation is handled with pandas which greatly simplifies the
+binning and aggregation logic.
+
+The public API mirrors the previous implementation:
+
+``bin_selection``
+    Choose a sensible number of bins for a given sample size.
+
+``ale_1d`` and ``ale_2d``
+    Compute 1‑D and 2‑D centred ALE curves.
+
+The functions accept a callable ``f`` that maps a data frame to predictions
+and return NumPy arrays in order to remain lightweight for plotting.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Tuple
+
 import numpy as np
-from scipy.stats import ks_2samp
-from sklearn.manifold import MDS
+import pandas as pd
 
-def bin_selection(n):
-    # choose closest divisor to sqrt(n)
-    # list of divisors of n
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+
+
+def bin_selection(n: int) -> int:
+    """Select a number of bins close to ``sqrt(n)``.
+
+    Parameters
+    ----------
+    n:
+        Number of observations.
+    """
+
     divisors = [i for i in range(1, n + 1) if n % i == 0]
-    closest_divisor = min(divisors, key=lambda x: abs(x - np.sqrt(n)))
-    return closest_divisor 
+    return min(divisors, key=lambda x: abs(x - np.sqrt(n)))
 
-def calculate_edges(x, bins, categorical=False):
+
+def calculate_edges(x: pd.Series, bins: int, categorical: bool = False) -> np.ndarray:
+    """Return bin edges for ``x``.
+
+    For categorical features the unique values are used as edges.  For
+    continuous features equal–mass bins are employed.
+    """
+
     if categorical:
-        # set to sorted unique values
-        edges = np.sort(np.unique(x))
-        edges = np.append(edges, edges[-1] + np.finfo(np.float16).eps)  # ensure max
+        edges = np.sort(x.unique())
+        # append a tiny amount to create the upper edge of the final bin
+        edges = np.append(edges, edges[-1] + np.finfo(float).eps)
     else:
-        # equal-mass bin edges
-        edges = np.quantile(x, np.linspace(0, 1, bins + 1))
-        edges[0], edges[-1] = x.min(), x.max() + np.finfo(np.float16).eps # ensure min/max
+        quantiles = np.linspace(0, 1, bins + 1)
+        edges = x.quantile(quantiles).to_numpy()
+        edges[0] = x.min()
+        edges[-1] = x.max() + np.finfo(float).eps
     return edges
 
-def calculate_bins(x, edges):
-    K = len(edges) - 1  # number of bins
-    n = len(x)
-    # calculate bin for each observation
-    k_x = np.zeros(n, dtype=int)
-    for i, xi in enumerate(x):
-        k_x[i] = int(np.searchsorted(edges, xi, side='right'))
 
-    # calculate observations per bin
-    N_k = np.zeros(K)
-    for k in range(1, K + 1):
-        mask = k_x == k
-        N_k[k - 1] = mask.sum()
+def calculate_bins(x: pd.Series, edges: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Assign each observation in ``x`` to a bin defined by ``edges``.
 
-    return k_x, N_k
+    Returns
+    -------
+    k_x:
+        1‑based bin index for every observation.
+    N_k:
+        Number of observations per bin.
+    """
 
-def calculate_bins_2d(x1, x2, edges_1, edges_2):
-    K = len(edges_1) - 1  # number of bins for first feature
-    M = len(edges_2) - 1  # number of bins for second feature
-    n = len(x1)
-    # calculate bin for each observation
-    k_x = np.zeros(n, dtype=int)
-    for i, xi in enumerate(x1):
-        k_x[i] = int(np.searchsorted(edges_1, xi, side='right'))
+    K = len(edges) - 1
+    bins = pd.cut(x, edges, labels=False, include_lowest=True)
+    k_x = bins.astype(int) + 1  # convert to 1‑based indexing
+    counts = k_x.value_counts(sort=False).reindex(range(1, K + 1), fill_value=0)
+    return k_x.to_numpy(), counts.to_numpy()
 
-    m_x = np.zeros(n, dtype=int)
-    for i, xi in enumerate(x2):
-        m_x[i] = int(np.searchsorted(edges_2, xi, side='right'))
 
-    # calculate observations per bin
-    N_km = np.zeros((K, M))
-    for k in range(1, K + 1):
-        for m in range(1, M + 1):
-            mask = (k_x == k) & (m_x == m)
-            N_km[k - 1, m - 1] = mask.sum()
-    N_k = N_km.sum(axis=0)
-    N_m = N_km.sum(axis=1)
+def calculate_bins_2d(
+    x1: pd.Series, x2: pd.Series, edges_1: np.ndarray, edges_2: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Two‑dimensional binning used for interaction ALE plots."""
 
-    return k_x, m_x, N_k, N_m, N_km
+    K = len(edges_1) - 1
+    M = len(edges_2) - 1
 
-def calculate_deltas(f, X, idx, edges, k_x):
-    # use vectorization while evaluating f
+    bins1 = pd.cut(x1, edges_1, labels=False, include_lowest=True).astype(int) + 1
+    bins2 = pd.cut(x2, edges_2, labels=False, include_lowest=True).astype(int) + 1
+
+    counts = (
+        pd.crosstab(bins1, bins2, dropna=False)
+        .reindex(index=range(1, K + 1), columns=range(1, M + 1), fill_value=0)
+    )
+
+    N_k = counts.sum(axis=1).to_numpy()
+    N_m = counts.sum(axis=0).to_numpy()
+    return bins1.to_numpy(), bins2.to_numpy(), N_k, N_m, counts.to_numpy()
+
+
+def calculate_deltas(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    idx: int,
+    edges: np.ndarray,
+    k_x: np.ndarray,
+) -> np.ndarray:
+    """Per‑observation local effects for feature ``idx``."""
+
+    col = X.columns[idx]
     X_left = X.copy()
     X_right = X.copy()
-    n = X.shape[0]
-    for i in range(n):
-        X_left[i, idx] = edges[k_x[i] - 1]
-        X_right[i, idx] = edges[k_x[i]]
-    deltas = f(X_right) - f(X_left)
-    return deltas
 
-def calculate_deltas_2d(f, X, idx_1, idx_2, edges_1, edges_2, k_x, m_x):
-    X_left_up = X.copy()
-    X_right_up = X.copy()
-    X_left_down = X.copy()
-    X_right_down = X.copy()
-    n = X.shape[0]
-    for i in range(n):
-        X_left_up[i, idx_1] = edges_1[k_x[i] - 1]
-        X_left_up[i, idx_2] = edges_2[m_x[i]]
-        X_right_up[i, idx_1] = edges_1[k_x[i]]
-        X_right_up[i, idx_2] = edges_2[m_x[i]]
-        X_left_down[i, idx_1] = edges_1[k_x[i] - 1]
-        X_left_down[i, idx_2] = edges_2[m_x[i] - 1]
-        X_right_down[i, idx_1] = edges_1[k_x[i]]
-        X_right_down[i, idx_2] = edges_2[m_x[i] - 1]
-    deltas = (f(X_right_up) - f(X_left_up)) - (f(X_right_down) - f(X_left_down))
-    return deltas
+    left = pd.Series(edges[k_x - 1], index=X.index)
+    right = pd.Series(edges[k_x], index=X.index)
+    X_left[col] = left.values
+    X_right[col] = right.values
+
+    return np.asarray(f(X_right) - f(X_left)).reshape(-1)
 
 
-def ale_1d(f, X, feature_idx, bins, categorical=False):
+def calculate_deltas_2d(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    idx_1: int,
+    idx_2: int,
+    edges_1: np.ndarray,
+    edges_2: np.ndarray,
+    k_x: np.ndarray,
+    m_x: np.ndarray,
+) -> np.ndarray:
+    """Local effects for the interaction between two features."""
+
+    col1, col2 = X.columns[idx_1], X.columns[idx_2]
+
+    X_lu = X.copy()
+    X_ru = X.copy()
+    X_ld = X.copy()
+    X_rd = X.copy()
+
+    left1 = pd.Series(edges_1[k_x - 1], index=X.index)
+    right1 = pd.Series(edges_1[k_x], index=X.index)
+    left2 = pd.Series(edges_2[m_x - 1], index=X.index)
+    right2 = pd.Series(edges_2[m_x], index=X.index)
+
+    # upper path
+    X_lu[col1] = left1.values
+    X_lu[col2] = right2.values
+    X_ru[col1] = right1.values
+    X_ru[col2] = right2.values
+
+    # lower path
+    X_ld[col1] = left1.values
+    X_ld[col2] = left2.values
+    X_rd[col1] = right1.values
+    X_rd[col2] = left2.values
+
+    return np.asarray((f(X_ru) - f(X_lu)) - (f(X_rd) - f(X_ld))).reshape(-1)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+
+
+def ale_1d(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    feature_idx: int,
+    bins: int,
+    categorical: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute centred 1‑D ALE values.
+
+    Parameters
+    ----------
+    f:
+        Model prediction function.  Must accept a data frame and return a
+        one‑dimensional array of predictions.
+    X:
+        Data as a :class:`pandas.DataFrame`.
+    feature_idx:
+        1‑based index of the feature to analyse.
+    bins:
+        Number of bins for ALE calculation.
+    categorical:
+        Whether the feature is categorical.
     """
-    Compute centered 1-D ALE values for a numpy array X.
 
-    Inputs:
-    - f: the model function, takes a 1D array of shape (p,)
-    - X: numpy array of shape (n, p)
-    - feature_idx: 1-based index of the feature to analyze
-    - bins: number of bins for ALE calculation
-
-    Returns:
-    - edges: x_j values
-    - curve: ALE curve values at edges
-    """
-    idx = feature_idx - 1  # convert to 0-based index
-    x = X[:, idx]
+    idx = feature_idx - 1
+    x = X.iloc[:, idx]
     n = len(x)
-    K = np.unique(x).size if categorical else bins
+    K = x.nunique() if categorical else bins
 
     edges = calculate_edges(x, bins, categorical)
     k_x, N_k = calculate_bins(x, edges)
 
-    # calculate per-observation ALE values
     deltas = calculate_deltas(f, X, idx, edges, k_x)
 
-    average_deltas = np.zeros(K)
-    # average deltas for each bin
-    for k in range(1, K + 1):
-        average_deltas[k - 1] = (1 / N_k[k - 1]) * np.sum(deltas[k_x == k])
-    # accumulate
-    accumulated_uncentered = average_deltas.cumsum()
+    df = pd.DataFrame({"k": k_x, "delta": deltas})
+    average = (
+        df.groupby("k")[["delta"]].mean().reindex(range(1, K + 1), fill_value=0)
+    )
 
-    # average effect
-    average_effect = (1 / n) * np.sum(accumulated_uncentered * N_k)
+    accumulated = average["delta"].to_numpy().cumsum()
+    average_effect = (accumulated * N_k).sum() / n
+    curve = accumulated - average_effect
 
-    # center
-    curve = accumulated_uncentered - average_effect
-
-    # truncate edges for continuous features
     edges = edges[:-1] if categorical else edges[1:]
-
-    # prepend average effect for categorical features
-    # to handle the dummy last bin
-    curve = np.insert(curve[:-1], 0, -average_effect) if categorical else curve
+    if categorical:
+        curve = np.insert(curve[:-1], 0, -average_effect)
 
     return edges, curve
 
-def ale_2d(f, X, feature_idx_1, feature_idx_2, bins, categorical_1=False, categorical_2=False):
-    """
-    Compute centered 2-D ALE values that visualizes the effects
-    of an interaction term.
 
-    Inputs:
-    - f: the model function, takes a 1D array of shape (p,)
-    - X: numpy array of shape (n, p)
-    - feature_idx_1: 1-based index of the first feature
-    - feature_idx_2: 1-based index of the second feature
-    - bins: number of bins for ALE calculation
+def ale_2d(
+    f: Callable[[pd.DataFrame], np.ndarray],
+    X: pd.DataFrame,
+    feature_idx_1: int,
+    feature_idx_2: int,
+    bins: int,
+    categorical_1: bool = False,
+    categorical_2: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute centred 2‑D ALE values for an interaction term."""
 
-    Returns:
-    - points_1: x_j values for the first feature
-    - points_2: x_l values for the second feature
-    - curve: ALE curve values at bin midpoints
-    """
-    idx_1 = feature_idx_1 - 1  # convert to 0-based index
-    idx_2 = feature_idx_2 - 1  # convert to 0-based index
-    x1 = X[:, idx_1]
-    x2 = X[:, idx_2]
-    K = np.unique(x1).size - 1 if categorical_1 else bins
-    M = np.unique(x2).size - 1 if categorical_2 else bins
-    n = len(x1)
+    idx1, idx2 = feature_idx_1 - 1, feature_idx_2 - 1
+    x1, x2 = X.iloc[:, idx1], X.iloc[:, idx2]
+    K = x1.nunique() - 1 if categorical_1 else bins
+    M = x2.nunique() - 1 if categorical_2 else bins
+    n = len(X)
 
-    edges_1 = calculate_edges(x1, bins, categorical_1)
-    edges_2 = calculate_edges(x2, bins, categorical_2)
+    edges1 = calculate_edges(x1, bins, categorical_1)
+    edges2 = calculate_edges(x2, bins, categorical_2)
 
-    # calculate bin for each observation
-    k_x, m_x, N_k, N_m, N_km = calculate_bins_2d(x1, x2, edges_1, edges_2)
+    k_x, m_x, N_k, N_m, N_km = calculate_bins_2d(x1, x2, edges1, edges2)
+    deltas = calculate_deltas_2d(f, X, idx1, idx2, edges1, edges2, k_x, m_x)
 
-    # calculate per-observation ALE values
-    deltas = calculate_deltas_2d(f, X, idx_1, idx_2, edges_1, edges_2, k_x, m_x)
+    df = pd.DataFrame({"k": k_x, "m": m_x, "delta": deltas})
+    table = (
+        df.pivot_table(
+            index="k", columns="m", values="delta", aggfunc="mean", dropna=False
+        )
+        .reindex(index=range(1, K + 1), columns=range(1, M + 1), fill_value=0)
+        .to_numpy()
+    )
 
-    # average deltas for each bin
-    average_deltas = np.zeros((K, M))
-    for k in range(1, K + 1):
-        for m in range(1, M + 1):
-            mask = (k_x == k) & (m_x == m)
-            if N_km[k - 1, m - 1] > 0:
-                average_deltas[k - 1, m - 1] = (1 / N_km[k - 1, m - 1]) * np.sum(deltas[mask])
-    # accumulate
-    raw_accumulated = average_deltas.cumsum(axis=0).cumsum(axis=1)
-    
-    # cancel main effects
-    main_effect_1 = np.zeros(K)
-    for k in range(1, K + 1):
-        mask = (k_x == k)
-        if N_k[k - 1] > 0:
-            main_effect_1[k - 1] = (1 / N_k[k - 1]) * np.dot(average_deltas[k - 1, :] - average_deltas[k - 1, :], N_km[k - 1, :])
-    main_accumulated_1 = main_effect_1.cumsum()
+    raw_acc = table.cumsum(axis=0).cumsum(axis=1)
 
-    main_effect_2 = np.zeros(M)
-    for m in range(1, M + 1):
-        mask = (m_x == m)
-        if N_m[m - 1] > 0:
-            main_effect_2[m - 1] = (1 / N_m[m - 1]) * np.dot(average_deltas[:, m - 1] - average_deltas[:, m - 1], N_km[:, m - 1])
-    main_accumulated_2 = main_effect_2.cumsum()
+    counts = pd.DataFrame(N_km, index=range(1, K + 1), columns=range(1, M + 1))
+    overall_mean = (raw_acc * counts).to_numpy().sum() / n
+    row_mean = (raw_acc * counts).sum(axis=1).to_numpy() / N_k
+    col_mean = (raw_acc * counts).sum(axis=0).to_numpy() / N_m
+    curve = raw_acc - row_mean[:, None] - col_mean[None, :] + overall_mean
 
-    # NOTE: uses broadcasting
-    accumulated_uncentered = raw_accumulated - main_accumulated_1[:, None] - main_accumulated_2[None, :]
-
-    # center
-    curve = accumulated_uncentered - (1 / n) * (N_km * accumulated_uncentered).sum()
-
-    # truncate edges for continuous features
-    points_1 = edges_1[:-1] if categorical_1 else edges_1[1:]
-    points_2 = edges_2[:-1] if categorical_2 else edges_2[1:]
-
+    points_1 = edges1[:-1] if categorical_1 else edges1[1:]
+    points_2 = edges2[:-1] if categorical_2 else edges2[1:]
     return points_1, points_2, curve
+
+
+# End of module
+
