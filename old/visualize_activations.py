@@ -37,7 +37,9 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-def register_activation_hooks(model: nn.Module, layer_names: List[str]) -> Dict[str, torch.Tensor]:
+def register_activation_hooks(
+    model: nn.Module, layer_names: List[str]
+) -> Dict[str, torch.Tensor]:
     """Attach forward hooks to the given `layer_names` (attributes of `model`).
 
     Returns a dict that will be populated with activations at runtime.
@@ -47,6 +49,7 @@ def register_activation_hooks(model: nn.Module, layer_names: List[str]) -> Dict[
     def save_activation(name):
         def hook(_, __, output):
             activations[name] = output.detach().cpu()
+
         return hook
 
     for name in layer_names:
@@ -77,11 +80,29 @@ def tile_and_save(maps: torch.Tensor, title: str, out_path: Path, show: bool = F
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualise CNN activation maps on MNIST")
-    parser.add_argument("--checkpoint", type=Path, default="mnist_cnn.pt", help="Path to trained .pt file")
-    parser.add_argument("--sample-index", type=int, default=0, help="Index of test image to visualise")
-    parser.add_argument("--output-dir", type=Path, default=Path("activations"), help="Where to save PNG files")
-    parser.add_argument("--show", action="store_true", help="Display figures interactively as well as saving")
+    parser = argparse.ArgumentParser(
+        description="Visualise CNN activation maps on MNIST"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default="mnist_cnn.pt",
+        help="Path to trained .pt file",
+    )
+    parser.add_argument(
+        "--sample-index", type=int, default=0, help="Index of test image to visualise"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("activations"),
+        help="Where to save PNG files",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Display figures interactively as well as saving",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -116,7 +137,12 @@ def main():
     # plot and save activation maps
     for name, act in activations.items():
         # act shape: (1, C, H, W) -> (C, H, W)
-        tile_and_save(act.squeeze(0), f"{name} activation maps", args.output_dir / f"{name}_maps_{args.sample_index}.png", show=args.show)
+        tile_and_save(
+            act.squeeze(0),
+            f"{name} activation maps",
+            args.output_dir / f"{name}_maps_{args.sample_index}.png",
+            show=args.show,
+        )
 
     print(f"Activation maps saved to: {args.output_dir.resolve()}")
 

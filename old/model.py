@@ -1,6 +1,7 @@
 """
 Provides a minimal convolutional neural network for MNIST classification.
 """
+
 from torch import nn
 
 

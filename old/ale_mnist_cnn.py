@@ -105,7 +105,13 @@ class SklearnWrapper:
     PyALE may supply a *DataFrame* or *ndarray*; both are accepted.
     """
 
-    def __init__(self, head: nn.Module, device: torch.device, class_idx: int, softmax: bool = True):
+    def __init__(
+        self,
+        head: nn.Module,
+        device: torch.device,
+        class_idx: int,
+        softmax: bool = True,
+    ):
         self.head = head.to(device).eval()
         self.device = device
         self.cls = class_idx
@@ -127,14 +133,21 @@ class SklearnWrapper:
 # Data‑frame caching
 # -----------------------------------------------------------------------------
 
-def cache_flat_features(model: SmallCNN, device: torch.device, sample_frac: float) -> pd.DataFrame:
+
+def cache_flat_features(
+    model: SmallCNN, device: torch.device, sample_frac: float
+) -> pd.DataFrame:
     """Forward MNIST test set through model and capture flattened conv features."""
 
-    test_ds = datasets.MNIST("data", train=False, download=True, transform=transforms.ToTensor())
+    test_ds = datasets.MNIST(
+        "data", train=False, download=True, transform=transforms.ToTensor()
+    )
 
     if 0 < sample_frac < 1.0:
         rng = torch.Generator().manual_seed(42)
-        idx = torch.randperm(len(test_ds), generator=rng)[: int(len(test_ds) * sample_frac)]
+        idx = torch.randperm(len(test_ds), generator=rng)[
+            : int(len(test_ds) * sample_frac)
+        ]
         test_ds = torch.utils.data.Subset(test_ds, idx.tolist())
 
     loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=2)
@@ -154,14 +167,24 @@ def cache_flat_features(model: SmallCNN, device: torch.device, sample_frac: floa
 # CLI & main
 # -----------------------------------------------------------------------------
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="ALE plots for SmallCNN via PyALE")
     p.add_argument("--checkpoint", default="mnist_cnn.pt")
     p.add_argument("--output-dir", default="ale_out")
-    p.add_argument("--class-idx", type=int, default=0, help="Digit class to explain (0–9)")
+    p.add_argument(
+        "--class-idx", type=int, default=0, help="Digit class to explain (0–9)"
+    )
     p.add_argument("--grid-size", type=int, default=20, help="Quantile bins for ALE")
-    p.add_argument("--num-features", type=int, default=16, help="How many top‑variance features to plot")
-    p.add_argument("--sample-frac", type=float, default=1.0, help="Fraction of test set to use")
+    p.add_argument(
+        "--num-features",
+        type=int,
+        default=16,
+        help="How many top‑variance features to plot",
+    )
+    p.add_argument(
+        "--sample-frac", type=float, default=1.0, help="Fraction of test set to use"
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 

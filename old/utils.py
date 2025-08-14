@@ -1,7 +1,9 @@
 """
 Utility functions for training and evaluation.
 """
+
 import torch
+
 
 def set_seed(seed: int = 42):
     """Ensure reproducibility as much as possible."""

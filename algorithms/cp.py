@@ -3,6 +3,7 @@ import numpy as np
 # NOTE: I think all ALE is doing is basically CP
 # but we're going "along the data" instead of "along the axis".
 
+
 def ceteris_paribus(f, X, feature_idx, explain_idx, bins=10):
     """
     Calculate Ceteris Paribus (CP) values for a given feature.

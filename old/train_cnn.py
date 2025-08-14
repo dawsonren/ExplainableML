@@ -41,11 +41,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     transform = transforms.ToTensor()
-    train_ds = datasets.MNIST(root="data", train=True, download=True, transform=transform)
-    test_ds = datasets.MNIST(root="data", train=False, download=True, transform=transform)
+    train_ds = datasets.MNIST(
+        root="data", train=True, download=True, transform=transform
+    )
+    test_ds = datasets.MNIST(
+        root="data", train=False, download=True, transform=transform
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=256, shuffle=False, num_workers=2, pin_memory=True
+    )
 
     model = SmallCNN().to(device)
     criterion = nn.CrossEntropyLoss()
@@ -55,7 +63,9 @@ def main():
     for epoch in range(1, epochs + 1):
         avg_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         acc = evaluate(model, test_loader, device)
-        print(f"Epoch {epoch}/{epochs} — loss: {avg_loss:.4f} — test accuracy: {acc:.2f}%")
+        print(
+            f"Epoch {epoch}/{epochs} — loss: {avg_loss:.4f} — test accuracy: {acc:.2f}%"
+        )
 
     # Save weights so we can reuse them for activation visualisation later
     torch.save(model.state_dict(), "mnist_cnn.pt")
