@@ -5,7 +5,7 @@ Tests for consistency of ALE VIMs.
 import numpy as np
 import unittest
 from algorithms.ale import bin_selection
-from algorithms.ale_vim import ale_global_main, ale_connected_total, ale_quantile_total
+from algorithms.ale_vim import ale_main_vim, ale_connected_total, ale_quantile_total
 
 
 def generate_2d_data_normal(n, rho=0.5):
@@ -50,7 +50,7 @@ class TestALEVIMs(unittest.TestCase):
         ale_quantile_total_vals = np.zeros(replications)
 
         for r in range(replications):
-            ale_global_main_vals[r] = ale_global_main(f, X, 1, bins=K)
+            ale_global_main_vals[r] = ale_main_vim(f, X, 1, bins=K)
             ale_connected_total_vals[r] = ale_connected_total(f, X, 1, bins=K)
             ale_quantile_total_vals[r] = ale_quantile_total(f, X, 1, bins=K)
 

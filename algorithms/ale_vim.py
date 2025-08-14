@@ -4,7 +4,7 @@ from algorithms.ale import calculate_bins, calculate_deltas, ale_1d, calculate_e
 from algorithms.tree_partitioning import generate_connected_paths
 
 
-def ale_global_main(f, X, feature_idx, bins=10, categorical=False):
+def ale_main_vim(f, X, feature_idx, bins=10, categorical=False):
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n = len(x)
@@ -37,7 +37,8 @@ def ale_quantile_total(f, X, feature_idx, bins=10, categorical=False):
         for l in range(1, L + 1):
             u = (l - (1 / 2)) / L
             # compute the u-quantile of the deltas for bin k
-            g_values[l - 1, k - 1] = np.quantile(deltas[k - 1], u)
+            mask = k_x == k
+            g_values[l - 1, k - 1] = np.quantile(deltas[mask], u)
 
     # accumulate
     accumulated_g_values = g_values.cumsum(axis=1)
@@ -118,3 +119,7 @@ def ale_connected_total(f, X, feature_idx, bins=10, categorical=False):
         )
 
     return ale_vim / n
+
+
+def ale_total_vim(f, X, feature_idx, bins=10):
+    pass
