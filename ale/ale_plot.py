@@ -1,36 +1,27 @@
 import numpy as np
 
-from algorithms.shared import (
+from ale.shared import (
     calculate_bins,
     calculate_edges,
     calculate_deltas,
     calculate_bins_2d,
     calculate_deltas_2d,
     calculate_2d_finite_difference,
+    calculate_K,
 )
 
 
-def ale_1d(f, X, feature_idx, bins, categorical=False):
+def _ale_1d(f, X, feature_idx, bins, categorical=False):
     """
-    Compute centered 1-D ALE values for a numpy array X.
-
-    Inputs:
-    - f: the model function, takes a 1D array of shape (p,)
-    - X: numpy array of shape (n, p)
-    - feature_idx: 1-based index of the feature to analyze
-    - bins: number of bins for ALE calculation
-
-    Returns:
-    - edges: x_j values
-    - curve: ALE curve values at edges
+    Assumes X is a numpy array.
     """
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n = len(x)
-    K = np.unique(x).size if categorical else bins
 
     edges = calculate_edges(x, bins, categorical)
-    k_x, N_k = calculate_bins(x, edges)
+    K = calculate_K(edges, categorical)
+    k_x, N_k = calculate_bins(x, edges, categorical)
 
     # calculate per-observation ALE values
     deltas = calculate_deltas(f, X, idx, edges, k_x)
@@ -38,20 +29,26 @@ def ale_1d(f, X, feature_idx, bins, categorical=False):
     average_deltas = np.zeros(K)
     # average deltas for each bin
     for k in range(1, K + 1):
-        average_deltas[k - 1] = (1 / N_k[k - 1]) * np.sum(deltas[k_x == k])
+        if N_k[k - 1] > 0:
+            average_deltas[k - 1] = (1 / N_k[k - 1]) * np.sum(deltas[k_x == k])
 
     # accumulate
     accumulated_uncentered = np.pad(average_deltas.cumsum(), (1, 0), mode="constant")
 
     # center
-    curve = accumulated_uncentered - (1 / n) * np.sum(
-        (1 / 2) * (accumulated_uncentered[:-1] + accumulated_uncentered[1:]) * N_k
-    )
+    if categorical:
+        # NOTE: ignore final category since it has no effect
+        corrected = accumulated_uncentered[:-1]
+        curve = corrected - (1 / n) * np.sum(corrected * N_k)
+    else:
+        # NOTE: this is a trapezoid rule for integration
+        trapezoidal = (1 / 2) * (accumulated_uncentered[:-1] + accumulated_uncentered[1:])
+        curve = accumulated_uncentered - (1 / n) * np.sum(trapezoidal * N_k)
 
     return edges, curve
 
 
-def ale_2d(
+def _ale_2d(
     f, X, feature_idx_1, feature_idx_2, bins, categorical_1=False, categorical_2=False
 ):
     """
@@ -74,15 +71,17 @@ def ale_2d(
     idx_2 = feature_idx_2 - 1  # convert to 0-based index
     x1 = X[:, idx_1]
     x2 = X[:, idx_2]
-    K = np.unique(x1).size - 1 if categorical_1 else bins
-    M = np.unique(x2).size - 1 if categorical_2 else bins
     n = len(x1)
 
     edges_1 = calculate_edges(x1, bins, categorical_1)
     edges_2 = calculate_edges(x2, bins, categorical_2)
+    K = calculate_K(edges_1, categorical_1)  # number of bins for first feature
+    M = calculate_K(edges_2, categorical_2)  # number of bins for second feature
 
     # calculate bin for each observation
-    k_x, m_x, N_k, N_m, N_km = calculate_bins_2d(x1, x2, edges_1, edges_2)
+    k_x, m_x, N_k, N_m, N_km = calculate_bins_2d(
+        x1, x2, edges_1, edges_2, categorical_1, categorical_2
+    )
 
     # calculate per-observation ALE values
     deltas = calculate_deltas_2d(f, X, idx_1, idx_2, edges_1, edges_2, k_x, m_x)
@@ -96,6 +95,14 @@ def ale_2d(
                 average_deltas[k - 1, m - 1] = (1 / N_km[k - 1, m - 1]) * np.sum(
                     deltas[mask]
                 )
+            else:
+                # replace with nearest non-empty bin average
+                # TODO: this is a hack, improve later, R uses ann package
+                nearest_k = np.argmin(np.abs(np.arange(1, K + 1) - k))
+                nearest_m = np.argmin(np.abs(np.arange(1, M + 1) - m))
+                average_deltas[k - 1, m - 1] = (
+                    average_deltas[nearest_k, m - 1] + average_deltas[k - 1, nearest_m]
+                ) / 2
     # accumulate
     raw_accumulated = np.pad(
         average_deltas.cumsum(axis=0).cumsum(axis=1), ((1, 0), (1, 0)), mode="constant"
@@ -126,18 +133,28 @@ def ale_2d(
     )
 
     # center
-    curve = (
-        accumulated_uncentered
-        - (1 / n)
-        * (
-            N_km
-            * calculate_2d_finite_difference(
-                accumulated_uncentered[1:, 1:],
-                accumulated_uncentered[:-1, 1:],
-                accumulated_uncentered[1:, :-1],
-                accumulated_uncentered[:-1, :-1],
-            )
-        ).sum()
-    )
+    # NOTE: for categorical, the final category has no effect
+    if categorical_1 and categorical_2:
+        corrected = accumulated_uncentered[:-1, :-1]
+        curve = corrected - (1 / n) * (N_km * corrected).sum()
+    elif categorical_1 and not categorical_2:
+        # NOTE: this is a trapezoid rule for integration
+        trapezoidal = (1 / 2) * (
+            accumulated_uncentered[:-1, :-1] + accumulated_uncentered[:-1, 1:]
+        )
+        curve = accumulated_uncentered[:-1, :] - (1 / n) * (trapezoidal * N_km).sum()
+    elif not categorical_1 and categorical_2:
+        trapezoidal = (1 / 2) * (
+            accumulated_uncentered[:-1, :-1] + accumulated_uncentered[1:, :-1]
+        )
+        curve = accumulated_uncentered[:, :-1] - (1 / n) * (trapezoidal * N_km).sum()
+    else:
+        trapezoidal = (1 / 4) * (
+            accumulated_uncentered[:-1, :-1]
+            + accumulated_uncentered[1:, :-1]
+            + accumulated_uncentered[:-1, 1:]
+            + accumulated_uncentered[1:, 1:]
+        )
+        curve = accumulated_uncentered - (1 / n) * (trapezoidal * N_km).sum()
 
     return edges_1, edges_2, curve

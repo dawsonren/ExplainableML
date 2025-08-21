@@ -14,7 +14,7 @@ pip install cython numpy
 python setup.py build_ext --inplace
 ```
 
-Make sure to drag the `.so` output into `algorithms` after compilation.
+Make sure to drag the `.so` output into `ale` after compilation.
 
 ## Running Tests
 Run

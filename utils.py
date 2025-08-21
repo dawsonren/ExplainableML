@@ -1,24 +1,22 @@
 import numpy as np
 from tqdm.auto import tqdm
 
-from algorithms.ale_vim import ale_main_vim, ale_connected_total, ale_quantile_total
+from ale.ale import ALE
 
 
-def replicate_ale_vims(dgp, f, nvars, n, bins=20, replications=100, categorical=False):
+def replicate_ale_vim(dgp, f, n, bins=20, replications=100, categorical=None):
     """Replicate ALE variable importance."""
+    nvars = dgp(1).shape[1]  # number of variables in the DGP
     vim_mains = np.zeros((replications, nvars))
     vim_connected = np.zeros((replications, nvars))
     vim_quantiles = np.zeros((replications, nvars))
     for i in tqdm(range(replications), desc="Replicating ALE VIMs"):
         X = dgp(n)
-        for j in range(nvars):
-            vim_mains[i, j] = ale_main_vim(f, X, j + 1, bins, categorical=categorical)
-            vim_connected[i, j] = ale_connected_total(
-                f, X, j + 1, bins, categorical=categorical
-            )
-            vim_quantiles[i, j] = ale_quantile_total(
-                f, X, j + 1, bins, categorical=categorical
-            )
+        ale = ALE(f, X, bins=bins, categorical=categorical)
+        explanation = ale.explain()
+        vim_mains[i, :] = explanation.loc["main"].values
+        vim_connected[i, :] = explanation.loc["total_connected"].values
+        vim_quantiles[i, :] = explanation.loc["total_quantile"].values
 
     for j in range(nvars):
         print(
@@ -50,9 +48,10 @@ def replicate_ale_vims(dgp, f, nvars, n, bins=20, replications=100, categorical=
 
 
 def replicate_ale_vim_training(
-    dgp, f_factory, nvars, n, bins=20, replications=100, categorical=False
+    dgp, f_factory, n, bins=20, replications=100, categorical=None
 ):
     """Replicate ALE variable importance and train f on X."""
+    nvars = dgp(1)[0].shape[1]  # number of variables in the DGP
     vim_mains = np.zeros((replications, nvars))
     vim_connected = np.zeros((replications, nvars))
     vim_quantiles = np.zeros((replications, nvars))
@@ -60,14 +59,11 @@ def replicate_ale_vim_training(
         X, y = dgp(n)
         # maps training data to a function
         f = f_factory(X, y)
-        for j in range(nvars):
-            vim_mains[i, j] = ale_main_vim(f, X, j + 1, bins, categorical=categorical)
-            vim_connected[i, j] = ale_connected_total(
-                f, X, j + 1, bins, categorical=categorical
-            )
-            vim_quantiles[i, j] = ale_quantile_total(
-                f, X, j + 1, bins, categorical=categorical
-            )
+        ale = ALE(f, X, bins=bins, categorical=categorical)
+        explanation = ale.explain()
+        vim_mains[i, :] = explanation.loc["main"].values
+        vim_connected[i, :] = explanation.loc["total_connected"].values
+        vim_quantiles[i, :] = explanation.loc["total_quantile"].values
 
     for j in range(nvars):
         print(

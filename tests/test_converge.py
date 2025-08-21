@@ -4,8 +4,8 @@ Tests for consistency of ALE VIMs.
 
 import numpy as np
 import unittest
-from algorithms.ale import bin_selection
-from algorithms.ale_vim import ale_main_vim, ale_connected_total, ale_quantile_total
+from ale.ale_plot import bin_selection
+from ale.ale_vim import ale_main_vim, ale_connected_total, ale_quantile_total
 
 
 def generate_2d_data_normal(n, rho=0.5):
