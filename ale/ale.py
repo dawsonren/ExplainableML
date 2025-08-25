@@ -374,7 +374,7 @@ class ALE:
         Parameters:
         - include: A tuple specifying which explanations to include.
                    Options are 'main', 'total_quantile', 'total_connected', and 'interaction'.
-                   Default is ('main', 'total').
+                   Default is ('main', 'total_quantile', 'total_connected').
 
         Returns:
         - A pandas DataFrame containing the explanations for each feature.

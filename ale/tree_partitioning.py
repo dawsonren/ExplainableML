@@ -140,7 +140,7 @@ def _split_leaf(R: List[List[int]], X: np.ndarray, diffs: np.ndarray, j: int, ca
     return R_left, R_right
 
 
-def get_priority(R, reuse_tracker):
+def _get_priority(R, reuse_tracker):
     """
     Priority score (lower number is higher priority) for splitting
     paths R. We calculate the score as the negative of the maximum
@@ -165,7 +165,7 @@ def get_priority(R, reuse_tracker):
     return -max_elements_in_interval + duplication_penalty
 
 
-def perform_duplication(R, reuse_tracker):
+def _perform_duplication(R, reuse_tracker):
     """
     Duplicate elements of singleton intervals in R in order to
     enable splitting. Update reuse_tracker accordingly. These
@@ -227,10 +227,10 @@ def generate_connected_delta_values(
     while queue.qsize() < L:
         R = queue.get().path
         # NOTE: in-place
-        perform_duplication(R, reuse_tracker)
+        _perform_duplication(R, reuse_tracker)
         R_left, R_right = _split_leaf(R, X, deltas, idx, categorical)
-        priority_left = get_priority(R_left, reuse_tracker)
-        priority_right = get_priority(R_right, reuse_tracker)
+        priority_left = _get_priority(R_left, reuse_tracker)
+        priority_right = _get_priority(R_right, reuse_tracker)
         queue.put(PrioritizedPath(priority_left, R_left))
         queue.put(PrioritizedPath(priority_right, R_right))
     

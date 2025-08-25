@@ -23,22 +23,16 @@ def _ale_main_vim(f, X, feature_idx, bins, categorical):
 
 
 def _ale_interaction_vim(f, X, feature_idx, bins, categorical):
-    # TODO: debug
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n, d = X.shape
-    if categorical is None:
-        categorical = [False] * X.shape[1]
 
-    if len(categorical) != d:
-        raise ValueError("Length of categorical must match number of features in X.")
-
-    edges_idx = {}
-    edges_j = {}
     curve_ij = {}
+    k_j_x = {}
+    m_j_x = {}
 
     for j in set(range(d)) - {idx}:
-        edges_idx[j], edges_j[j], curve_ij[j] = _ale_2d(
+        edges_idx_j, edges_j, curve_ij[j] = _ale_2d(
             f,
             X,
             idx + 1,
@@ -47,19 +41,15 @@ def _ale_interaction_vim(f, X, feature_idx, bins, categorical):
             categorical_1=categorical[idx],
             categorical_2=categorical[j],
         )
-
-    k_j_x = {}
-    m_j_x = {}
-    for j in set(range(d)) - {idx}:
         k_j_x[j], m_j_x[j], _, _, _ = calculate_bins_2d(
-            x, X[:, j], edges_idx[j], edges_j[j], categorical_1=categorical[idx], categorical_2=categorical[j]
+            x, X[:, j], edges_idx_j, edges_j, categorical_1=categorical[idx], categorical_2=categorical[j]
         )
 
     edges, curve = _ale_1d(f, X, feature_idx, bins=bins, categorical=categorical[idx])
 
     k_x, _ = calculate_bins(x, edges, categorical=categorical[idx])
 
-    vim = 0
+    main_and_interaction = np.zeros(n)
     for i in range(n):
         importance = curve[k_x[i] - 1]
         importance += sum(
@@ -68,40 +58,36 @@ def _ale_interaction_vim(f, X, feature_idx, bins, categorical):
                 for j in set(range(d)) - {idx}
             ]
         )
-        vim += importance**2
+        main_and_interaction[i] = importance
 
-    return (1 / n) * vim
+    return np.var(main_and_interaction)
 
 
 def _diagnostic_statistic(f, X, bins, categorical):
     """
     Return the R^2 statistic for the second-order ALE model.
     """
-    # TODO: finish and debug
     n, d = X.shape
-    if categorical is None:
-        categorical = [False] * X.shape[1]
-
-    if len(categorical) != d:
-        raise ValueError("Length of categorical must match number of features in X.")
 
     y = f(X)
     e_fx = np.mean(y)
     var_x = np.var(y)
 
-    edges_j = {}
     first_order_effect = {}
-    edges_ij = {}
+    k_j_x = {}
+    m_j_x = {}
+    l_j_x = {}
     second_order_effect = {}
 
     for j in range(d):
-        edges_j[j], first_order_effect[j] = _ale_1d(
+        edges_j, first_order_effect[j] = _ale_1d(
             f, X, j + 1, bins=bins, categorical=categorical[j]
         )
+        k_j_x[j], _ = calculate_bins(X[:, j], edges_j, categorical[j])
 
     for j in range(d):
         for l in range(j + 1, d):
-            edge_j, edge_l, second_order_effect_jl = _ale_2d(
+            edge_j, edge_l, second_order_effect[(j, l)] = _ale_2d(
                 f,
                 X,
                 j + 1,
@@ -110,10 +96,26 @@ def _diagnostic_statistic(f, X, bins, categorical):
                 categorical_1=categorical[j],
                 categorical_2=categorical[l],
             )
+            m_j_x[j], l_j_x[l], _, _, _ = calculate_bins_2d(
+                X[:, j],
+                X[:, l],
+                edge_j,
+                edge_l,
+                categorical_1=categorical[j],
+                categorical_2=categorical[l],
+            )
+
 
     second_order_approx = np.zeros(n)
     for i in range(n):
-        pass
+        second_order_approx[i] = e_fx
+        for j in range(d):
+            second_order_approx[i] += first_order_effect[j][k_j_x[j][i] - 1]
+            for l in range(j + 1, d):
+                second_order_approx[i] += second_order_effect[(j, l)][m_j_x[j][i] - 1][l_j_x[l][i] - 1]
+
+    r_squared = 1 - (np.var(second_order_approx - y)) / var_x
+    return r_squared
 
 
 def generate_quantile_delta_values(L, K, deltas, k_x):
@@ -147,6 +149,12 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
 
     # collect deltas along paths ordered by total effect size
     deltas_by_path = generate_connected_delta_values(X, feature_idx, edges, deltas, categorical) if method == "connected" else generate_quantile_delta_values(L, K, deltas, k_x)
+
+    if categorical:
+        # pad zero at beginning of path and remove zero at end of path
+        # NOTE: this is because the last category has a zero delta value
+        deltas_by_path = np.pad(deltas_by_path, ((0, 0), (1, 0)), mode="constant", constant_values=0)
+        deltas_by_path = deltas_by_path[:, :-1]
 
     # accumulate and center
     g_values = deltas_by_path.cumsum(axis=1)
