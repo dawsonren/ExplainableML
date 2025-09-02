@@ -4,7 +4,7 @@ Tests for consistency of ALE VIMs.
 
 import numpy as np
 import unittest
-from ale.ale_plot import bin_selection
+from utils import bin_selection
 from ale.ale_vim import ale_main_vim, ale_connected_total, ale_quantile_total
 
 

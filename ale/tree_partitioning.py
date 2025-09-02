@@ -5,11 +5,11 @@ The implementation for categorical variable is elaborated below.
 NOTE: Why can't we just rebalance the X values at the beginning?
 1. By duplicating observations in intervals that have n_j(k) < L,
 we change the median, this should be discouraged.
-2. We don't know which observations to average together in intervals 
+2. We don't know which observations to average together in intervals
 that have n_j(k) > L.
 NOTE: I propose a two-part procedure. We always keep a priority queue
 of collections based on the largest number of observations in an interval.
-If we don't yet have L values in our heap, we duplicate any data points 
+If we don't yet have L values in our heap, we duplicate any data points
 we may need. We also somehow need to keep track of how many times things have been
 duplicated already, so that we keep the distribution of our data somewhat coherent.
 Heuristically, set our priority equal to the largest observations in an interval
@@ -21,7 +21,6 @@ observations that are being averaged.
 TODO: You might want to measure the maximum distance
 between points in this group, but that feels...too complicated.
 """
-
 
 from typing import List, Any
 import warnings
@@ -36,7 +35,7 @@ from ale.shared import calculate_K, calculate_bins
 @dataclass(order=True)
 class PrioritizedPath:
     priority: int
-    path: Any=field(compare=False)
+    path: Any = field(compare=False)
 
 
 def _score_split(K, R, X, diffs, m, categorical):
@@ -77,7 +76,13 @@ def _score_split(K, R, X, diffs, m, categorical):
     return obj, medians, viable
 
 
-def _split_leaf(R: List[List[int]], X: np.ndarray, diffs: np.ndarray, j: int, categorical: List[bool]):
+def _split_leaf(
+    R: List[List[int]],
+    X: np.ndarray,
+    diffs: np.ndarray,
+    j: int,
+    categorical: List[bool],
+):
     """
     Implements Algorithm 1 for a single *leaf set* (R_1, …, R_K).
 
@@ -104,7 +109,9 @@ def _split_leaf(R: List[List[int]], X: np.ndarray, diffs: np.ndarray, j: int, ca
     best_medians = None
     # evaluate every candidate feature
     for m in candidate_features:
-        obj, medians, viable = _score_split(K, R, X, diffs, m, categorical=categorical[m])
+        obj, medians, viable = _score_split(
+            K, R, X, diffs, m, categorical=categorical[m]
+        )
 
         if viable and obj > best_obj:
             best_obj = obj
@@ -113,7 +120,9 @@ def _split_leaf(R: List[List[int]], X: np.ndarray, diffs: np.ndarray, j: int, ca
 
     # should be rare: if all variables flat, split on first variable
     if m_star is None:
-        warnings.warn("generate_connected_delta_values: all features flat, splitting on first variable")
+        warnings.warn(
+            "generate_connected_delta_values: all features flat, splitting on first variable"
+        )
         m_star = candidate_features[0]
         best_medians = np.array([np.median(X[R[k], m_star]) for k in range(K)])
 
@@ -161,7 +170,9 @@ def _get_priority(R, reuse_tracker):
     if all([len(interval) > 1 for interval in R]):
         duplication_penalty = 0
     else:
-        duplication_penalty = sum([reuse_tracker[interval[0]] for interval in R if len(interval) == 1])
+        duplication_penalty = sum(
+            [reuse_tracker[interval[0]] for interval in R if len(interval) == 1]
+        )
     return -max_elements_in_interval + duplication_penalty
 
 
@@ -180,12 +191,16 @@ def _perform_duplication(R, reuse_tracker):
         if len(interval) == 1:
             reuse_tracker[interval[0]] += 1
             interval.append(interval[0])
-    
+
     assert all([len(interval) > 1 for interval in R]), "Duplication failed"
 
 
-def generate_connected_delta_values(
-    X: np.ndarray, feature_idx: int, edges: np.ndarray, deltas: np.ndarray, categorical: List[bool]
+def generate_connected_paths(
+    X: np.ndarray,
+    feature_idx: int,
+    edges: np.ndarray,
+    deltas: np.ndarray,
+    categorical: List[bool],
 ) -> List[np.ndarray]:
     """
     Full recursive algorithm producing a (K, L) matrix of delta values.
@@ -203,7 +218,7 @@ def generate_connected_delta_values(
 
     Returns
     -------
-    deltas_by_path : (K, L) array of delta values
+    paths       : list of length L, each element is a length-K numpy array
     """
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
@@ -233,18 +248,14 @@ def generate_connected_delta_values(
         priority_right = _get_priority(R_right, reuse_tracker)
         queue.put(PrioritizedPath(priority_left, R_left))
         queue.put(PrioritizedPath(priority_right, R_right))
-    
+
     assert queue.qsize() == L, "Algorithm should yield exactly L paths"
 
     # pop everything into an iterable
     paths = []
     while queue.qsize() > 0:
-        paths.append(queue.get().path)
+        path = queue.get().path
+        path = [np.array(interval).flatten() for interval in path]
+        paths.append(path)
 
-    deltas_by_path = np.zeros((L, K))
-    # average across paths with multiple elements
-    for l, path in enumerate(paths):
-        for k, interval in enumerate(path):
-            deltas_by_path[l, k] = np.mean(deltas[interval])
-
-    return deltas_by_path
+    return paths

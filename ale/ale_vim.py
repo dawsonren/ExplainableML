@@ -6,9 +6,9 @@ from ale.shared import (
     calculate_deltas,
     calculate_edges,
     calculate_bins_2d,
-    calculate_K
+    calculate_K,
 )
-from ale.tree_partitioning import generate_connected_delta_values
+from ale.tree_partitioning import generate_connected_paths
 
 
 def _ale_main_vim(f, X, feature_idx, bins, categorical):
@@ -42,7 +42,12 @@ def _ale_interaction_vim(f, X, feature_idx, bins, categorical):
             categorical_2=categorical[j],
         )
         k_j_x[j], m_j_x[j], _, _, _ = calculate_bins_2d(
-            x, X[:, j], edges_idx_j, edges_j, categorical_1=categorical[idx], categorical_2=categorical[j]
+            x,
+            X[:, j],
+            edges_idx_j,
+            edges_j,
+            categorical_1=categorical[idx],
+            categorical_2=categorical[j],
         )
 
     edges, curve = _ale_1d(f, X, feature_idx, bins=bins, categorical=categorical[idx])
@@ -105,14 +110,15 @@ def _diagnostic_statistic(f, X, bins, categorical):
                 categorical_2=categorical[l],
             )
 
-
     second_order_approx = np.zeros(n)
     for i in range(n):
         second_order_approx[i] = e_fx
         for j in range(d):
             second_order_approx[i] += first_order_effect[j][k_j_x[j][i] - 1]
             for l in range(j + 1, d):
-                second_order_approx[i] += second_order_effect[(j, l)][m_j_x[j][i] - 1][l_j_x[l][i] - 1]
+                second_order_approx[i] += second_order_effect[(j, l)][m_j_x[j][i] - 1][
+                    l_j_x[l][i] - 1
+                ]
 
     r_squared = 1 - (np.var(second_order_approx - y)) / var_x
     return r_squared
@@ -144,16 +150,27 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
     k_x, N_k = calculate_bins(x, edges, categorical[idx])
     # bin over average x_j value
     k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side="right")), 1, K)
-    
+
     deltas = calculate_deltas(f, X, idx, edges, k_x)
 
     # collect deltas along paths ordered by total effect size
-    deltas_by_path = generate_connected_delta_values(X, feature_idx, edges, deltas, categorical) if method == "connected" else generate_quantile_delta_values(L, K, deltas, k_x)
+    if method == "connected":
+        paths = generate_connected_paths(X, feature_idx, edges, deltas, categorical)
+        deltas_by_path = np.zeros((L, K))
+        # average across paths with multiple elements
+        for l, path in enumerate(paths):
+            for k, interval in enumerate(path):
+                deltas_by_path[l, k] = np.mean(deltas[interval])
+    else:
+        paths = None
+        deltas_by_path = generate_quantile_delta_values(L, K, deltas, k_x)
 
     if categorical:
         # pad zero at beginning of path and remove zero at end of path
         # NOTE: this is because the last category has a zero delta value
-        deltas_by_path = np.pad(deltas_by_path, ((0, 0), (1, 0)), mode="constant", constant_values=0)
+        deltas_by_path = np.pad(
+            deltas_by_path, ((0, 0), (1, 0)), mode="constant", constant_values=0
+        )
         deltas_by_path = deltas_by_path[:, :-1]
 
     # accumulate and center
@@ -164,4 +181,49 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
     average_g_value = (1 / n) * (centered_g_values * (N_k / L)).sum()
     ale_vim = (1 / n) * ((centered_g_values - average_g_value) ** 2 * (N_k / L)).sum()
 
-    return ale_vim
+    return ale_vim, paths
+
+
+def _ale_local_vim(f, X, paths, feature_idx, explain_idx, bins=10, categorical=None):
+    idx = feature_idx - 1  # convert to 0-based index
+    x = X[:, idx]
+    n = len(x)
+
+    edges = calculate_edges(x, bins, categorical[idx])
+    K = calculate_K(edges, categorical[idx])
+    L = n // K
+
+    k_x, _ = calculate_bins(x, edges, categorical[idx])
+    # bin over average x_j value
+    k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side="right")), 1, K)
+
+    deltas = calculate_deltas(f, X, idx, edges, k_x)
+    deltas_by_path = np.zeros((L, K))
+    # average across paths with multiple elements
+    for l, path in enumerate(paths):
+        for k, interval in enumerate(path):
+            deltas_by_path[l, k] = np.mean(deltas[interval])
+
+    if categorical:
+        # pad zero at beginning of path and remove zero at end of path
+        # NOTE: this is because the last category has a zero delta value
+        deltas_by_path = np.pad(
+            deltas_by_path, ((0, 0), (1, 0)), mode="constant", constant_values=0
+        )
+        deltas_by_path = deltas_by_path[:, :-1]
+
+    # accumulate and center
+    g_values = deltas_by_path.cumsum(axis=1)
+    centered_g_values = g_values - g_values[:, k_bar - 1][:, None]
+
+    # find the index of the path containing the observation to explain
+    path_idx = None
+    for l, path in enumerate(paths):
+        for interval in path:
+            if explain_idx in interval:
+                path_idx = l
+                break
+        if path_idx is not None:
+            break
+
+    return centered_g_values[path_idx, k_x[explain_idx] - 1]

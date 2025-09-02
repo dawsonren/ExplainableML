@@ -3,14 +3,6 @@ from sklearn.manifold import MDS
 import pandas as pd
 
 
-def bin_selection(n):
-    # choose closest divisor to sqrt(n)
-    # list of divisors of n
-    divisors = [i for i in range(1, n + 1) if n % i == 0]
-    closest_divisor = min(divisors, key=lambda x: abs(x - np.sqrt(n)))
-    return closest_divisor
-
-
 def calculate_K(edges, categorical=False):
     if categorical:
         K = len(edges)  # number of unique categories
@@ -24,7 +16,9 @@ def calculate_edges(x, bins, categorical=False):
         # set to sorted unique values
         edges = np.sort(np.unique(x))
     else:
-        bins = min(bins, np.unique(x).size - 1)  # ensure bins does not exceed unique values
+        bins = min(
+            bins, np.unique(x).size - 1
+        )  # ensure bins does not exceed unique values
         # equal-mass bin edges
         edges = np.quantile(x, np.linspace(0, 1, bins + 1))
         edges = np.unique(edges)  # remove duplicates
@@ -51,7 +45,9 @@ def calculate_bins(x, edges, categorical=False):
     return k_x, N_k
 
 
-def calculate_bins_2d(x1, x2, edges_1, edges_2, categorical_1=False, categorical_2=False):
+def calculate_bins_2d(
+    x1, x2, edges_1, edges_2, categorical_1=False, categorical_2=False
+):
     K = calculate_K(edges_1, categorical_1)
     M = calculate_K(edges_2, categorical_2)
     n = len(x1)
@@ -161,15 +157,11 @@ def relabel_categorical_features(X, idx, categorical):
     for j in set(range(X.shape[1])) - {idx}:
         if categorical[j]:
             # TV distance for categorical features
-            contingency_table = pd.crosstab(
-                X[:, idx], X[:, j]
-            ) / n
+            contingency_table = pd.crosstab(X[:, idx], X[:, j]) / n
             contingency_table = contingency_table.values / n
             for i in range(K):
                 for k in range(i + 1, K):
-                    dist = tv_distance(
-                        contingency_table[i, :], contingency_table[k, :]
-                    )
+                    dist = tv_distance(contingency_table[i, :], contingency_table[k, :])
                     distance_matrix[i, k] += dist
                     distance_matrix[k, i] += dist
         else:
@@ -192,7 +184,9 @@ def relabel_categorical_features(X, idx, categorical):
 
                 # sort the values for the empirical CDF
                 xi_sorted = np.sort(xi)
-                ecdf_vals[lvl] = np.searchsorted(xi_sorted, q_x_all, side="right") / xi_sorted.size
+                ecdf_vals[lvl] = (
+                    np.searchsorted(xi_sorted, q_x_all, side="right") / xi_sorted.size
+                )
 
             for i in range(K):
                 for k in range(i + 1, K):

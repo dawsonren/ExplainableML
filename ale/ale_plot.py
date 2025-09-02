@@ -42,7 +42,9 @@ def _ale_1d(f, X, feature_idx, bins, categorical=False):
         curve = corrected - (1 / n) * np.sum(corrected * N_k)
     else:
         # NOTE: this is a trapezoid rule for integration
-        trapezoidal = (1 / 2) * (accumulated_uncentered[:-1] + accumulated_uncentered[1:])
+        trapezoidal = (1 / 2) * (
+            accumulated_uncentered[:-1] + accumulated_uncentered[1:]
+        )
         curve = accumulated_uncentered - (1 / n) * np.sum(trapezoidal * N_k)
 
     return edges, curve
