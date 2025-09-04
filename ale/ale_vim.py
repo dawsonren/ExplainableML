@@ -181,40 +181,15 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
     average_g_value = (1 / n) * (centered_g_values * (N_k / L)).sum()
     ale_vim = (1 / n) * ((centered_g_values - average_g_value) ** 2 * (N_k / L)).sum()
 
-    return ale_vim, paths
+    return ale_vim, paths, centered_g_values
 
 
-def _ale_local_vim(f, X, paths, feature_idx, explain_idx, bins=10, categorical=None):
+def _ale_local_vim(X, paths, feature_idx, explain_idx, centered_g_values, bins=10, categorical=None):
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
-    n = len(x)
 
     edges = calculate_edges(x, bins, categorical[idx])
-    K = calculate_K(edges, categorical[idx])
-    L = n // K
-
     k_x, _ = calculate_bins(x, edges, categorical[idx])
-    # bin over average x_j value
-    k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side="right")), 1, K)
-
-    deltas = calculate_deltas(f, X, idx, edges, k_x)
-    deltas_by_path = np.zeros((L, K))
-    # average across paths with multiple elements
-    for l, path in enumerate(paths):
-        for k, interval in enumerate(path):
-            deltas_by_path[l, k] = np.mean(deltas[interval])
-
-    if categorical:
-        # pad zero at beginning of path and remove zero at end of path
-        # NOTE: this is because the last category has a zero delta value
-        deltas_by_path = np.pad(
-            deltas_by_path, ((0, 0), (1, 0)), mode="constant", constant_values=0
-        )
-        deltas_by_path = deltas_by_path[:, :-1]
-
-    # accumulate and center
-    g_values = deltas_by_path.cumsum(axis=1)
-    centered_g_values = g_values - g_values[:, k_bar - 1][:, None]
 
     # find the index of the path containing the observation to explain
     path_idx = None

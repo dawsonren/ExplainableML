@@ -48,6 +48,8 @@ class ALE(Explanation):
 
         # keep track of connected paths from total connected VIM
         self.connected_paths = {}
+        # keep track of centered g-values from total connected VIM
+        self.centered_g_values = {}
 
     def _wrap_convert_function(self, f):
         """
@@ -338,7 +340,7 @@ class ALE(Explanation):
         if method not in ["connected", "quantile"]:
             raise ValueError("Method must be either 'connected' or 'quantile'.")
 
-        total_vim, paths = _ale_total_vim(
+        total_vim, paths, centered_g_values = _ale_total_vim(
             self.f,
             self.X_values,
             idx + 1,
@@ -349,6 +351,7 @@ class ALE(Explanation):
         # store the generated paths for potential reuse
         if method == "connected":
             self.connected_paths[idx] = paths
+            self.centered_g_values[idx] = centered_g_values
         return total_vim
 
     def explain(self, include=("main", "total_quantile", "total_connected")):
@@ -413,11 +416,11 @@ class ALE(Explanation):
                     f"Connected paths for feature index {i + 1} not found. Please run ale_total_vim with method='connected' first."
                 )
             local_vim = _ale_local_vim(
-                self.f,
                 self.X_values,
                 self.connected_paths[i],
                 i + 1,
                 explain_idx,
+                self.centered_g_values[i],
                 self.bins,
                 self.categorical,
             )

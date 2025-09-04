@@ -3,9 +3,10 @@ Tests for consistency of ALE VIMs.
 """
 
 import numpy as np
+import scipy.stats as stats
 import unittest
 from utils import bin_selection
-from ale.ale_vim import ale_main_vim, ale_connected_total, ale_quantile_total
+from ale import ALE
 
 
 def generate_2d_data_normal(n, rho=0.5):
@@ -28,7 +29,7 @@ def check_in_confidence_interval(samples, theoretical_value, alpha=0.05):
     mean = np.mean(samples)
     std = np.std(samples, ddof=1)
     n = len(samples)
-    z_score = 1.96  # for 95% confidence interval
+    z_score = stats.norm.ppf(1 - alpha / 2)  # for 1 - alpha confidence interval
     margin_of_error = z_score * (std / np.sqrt(n))
     lower_bound = mean - margin_of_error
     upper_bound = mean + margin_of_error
@@ -50,9 +51,10 @@ class TestALEVIMs(unittest.TestCase):
         ale_quantile_total_vals = np.zeros(replications)
 
         for r in range(replications):
-            ale_global_main_vals[r] = ale_main_vim(f, X, 1, bins=K)
-            ale_connected_total_vals[r] = ale_connected_total(f, X, 1, bins=K)
-            ale_quantile_total_vals[r] = ale_quantile_total(f, X, 1, bins=K)
+            ale = ALE(f, X, bins=K)
+            ale_global_main_vals[r] = ale.ale_main_vim(1)
+            ale_connected_total_vals[r] = ale.ale_total_vim(1, method="connected")
+            ale_quantile_total_vals[r] = ale.ale_total_vim(1, method="quantile")
 
         theoretical_main = 6 / 5
         theoretical_total = 6 / 5 + sigma**2
