@@ -37,7 +37,7 @@ def k_lasso(X, y, weights, relevant_features):
 
 
 class LIME(Explanation):
-    def __init__(self, f, X, feature_names=None, categorical=None, verbose=True):
+    def __init__(self, f, X, feature_names=None, categorical=None, verbose=True, kernel_width=None):
         """
         Linear Interpretable Model Explanations explainer.
 
@@ -49,6 +49,7 @@ class LIME(Explanation):
         """
         super().__init__(f, X, feature_names=feature_names, categorical=categorical)
         self.verbose = verbose
+        self.kernel_width = kernel_width if kernel_width is not None else KERNEL_WIDTH_MULTIPLIER * self.d
 
     def calculate_coefficients(self, n_X, n_y, distances, relevant_features):
         """Takes perturbed data, labels and distances, returns explanation.
@@ -66,7 +67,7 @@ class LIME(Explanation):
         """
         # construct weights using kernel function
         weights = exponential_kernel(
-            distances, kernel_width=KERNEL_WIDTH_MULTIPLIER * self.d
+            distances, kernel_width=self.kernel_width
         )
 
         # select num_features features
@@ -144,6 +145,10 @@ class LIME(Explanation):
         """
         Produce LIME plots for all features for a given observation.
         """
+        # check explain_idx is int
+        if not isinstance(explain_idx, int):
+            raise ValueError("explain_idx must be an integer.")
+
         n_features = self.X.shape[1]
         explain_X = self.X_values[explain_idx, :]
         explain_X = explain_X.reshape(-1, 1)

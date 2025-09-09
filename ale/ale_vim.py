@@ -138,7 +138,7 @@ def generate_quantile_delta_values(L, K, deltas, k_x):
     return deltas_by_path
 
 
-def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=None):
+def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=None, interpolate=False):
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n = len(x)
@@ -148,7 +148,6 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
     L = n // K
 
     k_x, N_k = calculate_bins(x, edges, categorical[idx])
-    # bin over average x_j value
     k_bar = np.clip(int(np.searchsorted(edges, x.mean(), side="right")), 1, K)
 
     deltas = calculate_deltas(f, X, idx, edges, k_x)
@@ -175,7 +174,19 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
 
     # accumulate and center
     g_values = deltas_by_path.cumsum(axis=1)
-    centered_g_values = g_values - g_values[:, k_bar - 1][:, None]
+    if interpolate:
+        # assume that g behaves approximately linearly between bin points
+        weight = (x.mean() - edges[k_bar - 1]) / (edges[k_bar] - edges[k_bar - 1])
+        if feature_idx == 1:
+            print('x_bar', x.mean(), 'set to', edges[k_bar] * weight + edges[k_bar - 1] * (1 - weight))
+        centered_g_values = g_values - (weight * g_values[:, k_bar] + (1 - weight) * g_values[:, k_bar - 1])[:, None]
+    else:
+        if feature_idx == 1:
+            print('x_bar', x.mean(), 'rounded to', edges[k_bar-1], edges)
+        centered_g_values = g_values - g_values[:, k_bar - 1][:, None]
+
+    if feature_idx == 1:
+        print('E[X^2] estimated on edges: ', (edges ** 2).mean())
 
     # find variance over paths/observations
     average_g_value = (1 / n) * (centered_g_values * (N_k / L)).sum()
@@ -201,4 +212,4 @@ def _ale_local_vim(X, paths, feature_idx, explain_idx, centered_g_values, bins=1
         if path_idx is not None:
             break
 
-    return centered_g_values[path_idx, k_x[explain_idx] - 1]
+    return centered_g_values[path_idx, k_x[explain_idx] - 1], edges, centered_g_values[path_idx, :]

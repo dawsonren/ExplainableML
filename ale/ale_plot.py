@@ -6,7 +6,6 @@ from ale.shared import (
     calculate_deltas,
     calculate_bins_2d,
     calculate_deltas_2d,
-    calculate_2d_finite_difference,
     calculate_K,
 )
 

@@ -1,7 +1,5 @@
 """
 Calculate Shapley values for explanation.
-
-
 """
 
 import numpy as np
@@ -10,7 +8,7 @@ import matplotlib.pyplot as plt
 from utils import Explanation
 
 
-def shapley_values(f, X, explain_idx, feature_idx, num_samples=100):
+def permutation_shapley_values(f, X, explain_idx, feature_idx, num_samples=100):
     """
     Calculate Shapley values for a specific feature.
 
@@ -27,6 +25,7 @@ def shapley_values(f, X, explain_idx, feature_idx, num_samples=100):
     # get x
     x = X[explain_idx, :]
     idx = feature_idx - 1
+    p = X.shape[1]
 
     # Initialize Shapley value
     shap_value = 0
@@ -37,18 +36,29 @@ def shapley_values(f, X, explain_idx, feature_idx, num_samples=100):
         z = X[np.random.choice(X.shape[0]), :]
 
         # choose a random permutation of feature indices
-        permuted_indices = np.random.permutation(X.shape[1])
+        perm = np.random.permutation(p)
+
+        # position where feature j appears in this permutation
+        j_pos = int(np.where(perm == idx)[0][0])
 
         # order the features according to the permutation
-        x_order = x[permuted_indices]
-        z_order = z[permuted_indices]
+        x_order = x[perm]
+        z_order = z[perm]
 
         # construct two new instances
-        x_with_j = np.concatenate([x_order[:idx], z_order[idx:]])
-        x_without_j = np.concatenate([x_order[: idx - 1], z_order[idx - 1 :]])
+        prefix = x_order[:j_pos]
+        suffix = z_order[j_pos + 1:]
+        x_with_j = np.array([*prefix, x_order[j_pos], *suffix])
+        x_without_j = np.array([*prefix, z_order[j_pos], *suffix])
+
+        # unpermute back to original order
+        inv_perm = np.empty(p, dtype=int)
+        inv_perm[perm] = np.arange(p)
+        x_with_j = x_with_j[inv_perm].reshape(1, -1)
+        x_without_j = x_without_j[inv_perm].reshape(1, -1)
 
         # get marginal contribution
-        shap_value += f(x_with_j.reshape(1, -1)) - f(x_without_j.reshape(1, -1))
+        shap_value += f(x_with_j) - f(x_without_j)
 
     return shap_value / num_samples
 
@@ -59,9 +69,13 @@ class SHAP(Explanation):
         self.verbose = verbose
 
     def explain_local(self, explain_idx, num_samples=100):
+        # check explain_idx is int
+        if not isinstance(explain_idx, int):
+            raise ValueError("explain_idx must be an integer.")
+        
         explanation = {}
         for i in range(self.d):
-            explanation[self.feature_names[i]] = shapley_values(
+            explanation[self.feature_names[i]] = permutation_shapley_values(
                 self.f, self.X_values, explain_idx, i + 1, num_samples=num_samples
             )
 

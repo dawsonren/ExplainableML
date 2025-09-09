@@ -38,7 +38,7 @@ class ALE(Explanation):
         self.bins = bins
         self.verbose = verbose
         # wrap f to handle categorical feature conversion
-        self.f = self._wrap_convert_function(f)
+        self.f = self._wrap_convert_function(self.f)
         # takes index of predictor to a dictionary of label to numerical label
         self.label_to_num = {}
         # takes index of predictor to a dictionary of numerical to original label
@@ -325,7 +325,7 @@ class ALE(Explanation):
             self.f, self.X_values, bins=self.bins, categorical=self.categorical
         )
 
-    def ale_total_vim(self, feature, method="connected"):
+    def ale_total_vim(self, feature, method="connected", interpolate=False):
         """
         Calculate the total ALE VIM for a given feature index (1-based).
 
@@ -347,6 +347,7 @@ class ALE(Explanation):
             method=method,
             bins=self.bins,
             categorical=self.categorical,
+            interpolate=interpolate
         )
         # store the generated paths for potential reuse
         if method == "connected":
@@ -354,7 +355,7 @@ class ALE(Explanation):
             self.centered_g_values[idx] = centered_g_values
         return total_vim
 
-    def explain(self, include=("main", "total_quantile", "total_connected")):
+    def explain(self, include=("main", "total_quantile", "total_connected"), interpolate=False):
         """
         Generate VIM explanations for all features in the dataset.
 
@@ -386,11 +387,11 @@ class ALE(Explanation):
                 explanation_i["main"] = np.sqrt(self.ale_main_vim(i + 1))
             if "total_quantile" in include:
                 explanation_i["total_quantile"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="quantile")
+                    self.ale_total_vim(i + 1, method="quantile", interpolate=interpolate)
                 )
             if "total_connected" in include:
                 explanation_i["total_connected"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="connected")
+                    self.ale_total_vim(i + 1, method="connected", interpolate=interpolate)
                 )
             if "interaction" in include:
                 explanation_i["interaction"] = np.sqrt(self.ale_interaction_vim(i + 1))
@@ -405,7 +406,13 @@ class ALE(Explanation):
         """
         Produce ALE local variable importances for all features for a given observation.
         """
+        # check explain_idx is int
+        if not isinstance(explain_idx, int):
+            raise ValueError("explain_idx must be an integer.")
+        
         explanations = {}
+        edges_lst = []
+        centered_g_list = []
         for i in range(self.d):
             if self.verbose:
                 print(
@@ -415,14 +422,16 @@ class ALE(Explanation):
                 raise ValueError(
                     f"Connected paths for feature index {i + 1} not found. Please run ale_total_vim with method='connected' first."
                 )
-            local_vim = _ale_local_vim(
+            local_vim, edges, centered_g = _ale_local_vim(
                 self.X_values,
                 self.connected_paths[i],
                 i + 1,
                 explain_idx,
                 self.centered_g_values[i],
                 self.bins,
-                self.categorical,
+                self.categorical
             )
             explanations[self.feature_names[i]] = local_vim
-        return explanations
+            edges_lst.append(edges)
+            centered_g_list.append(centered_g)
+        return explanations, edges_lst, centered_g_list

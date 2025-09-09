@@ -27,7 +27,8 @@ class Explanation:
 
         self.is_dataframe = isinstance(X, pd.DataFrame)
         self.n, self.d = X.shape
-        self.f = f
+        self.f = self._log_query_points(f)
+        self.query_log = set()
 
         if self.is_dataframe:
             # store the DataFrame and its values
@@ -59,6 +60,20 @@ class Explanation:
                     )
                 self.categorical = categorical
 
+    def _log_query_points(self, f):
+        """
+        Wrap the model function f to log its query points.
+        """
+        def wrapper(X, log=True):
+            # Log the query points
+            if log:
+                for i in range(X.shape[0]):
+                    self.query_log.add(tuple(X[i, :]))
+            return f(X)
+        return wrapper
+    
+    def get_query_points(self):
+        return np.array(list(self.query_log))
 
 def bin_selection(n):
     # choose closest divisor to sqrt(n)
