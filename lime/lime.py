@@ -3,7 +3,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from sklearn.linear_model import Ridge, lars_path
 
-from utils import Explanation
+from utils import Explanation, generalized_distance
 
 KERNEL_WIDTH_MULTIPLIER = 0.75
 
@@ -37,7 +37,15 @@ def k_lasso(X, y, weights, relevant_features):
 
 
 class LIME(Explanation):
-    def __init__(self, f, X, feature_names=None, categorical=None, verbose=True, kernel_width=None):
+    def __init__(
+        self,
+        f,
+        X,
+        feature_names=None,
+        categorical=None,
+        verbose=True,
+        kernel_width=None,
+    ):
         """
         Linear Interpretable Model Explanations explainer.
 
@@ -49,7 +57,11 @@ class LIME(Explanation):
         """
         super().__init__(f, X, feature_names=feature_names, categorical=categorical)
         self.verbose = verbose
-        self.kernel_width = kernel_width if kernel_width is not None else KERNEL_WIDTH_MULTIPLIER * self.d
+        self.kernel_width = (
+            kernel_width
+            if kernel_width is not None
+            else KERNEL_WIDTH_MULTIPLIER * self.d
+        )
 
     def calculate_coefficients(self, n_X, n_y, distances, relevant_features):
         """Takes perturbed data, labels and distances, returns explanation.
@@ -66,9 +78,7 @@ class LIME(Explanation):
             local_pred: prediction of the local linear model on the original data point
         """
         # construct weights using kernel function
-        weights = exponential_kernel(
-            distances, kernel_width=self.kernel_width
-        )
+        weights = exponential_kernel(distances, kernel_width=self.kernel_width)
 
         # select num_features features
         used_features = k_lasso(n_X, n_y, weights, relevant_features)
@@ -111,6 +121,7 @@ class LIME(Explanation):
         """
         # generate perturbations
         n_X = np.zeros((num_samples, self.d))
+        std_devs = np.std(self.X_values, axis=0)
         for i in range(self.d):
             if self.categorical[i]:
                 # for categorical features, weighted sample from the existing categories
@@ -121,37 +132,29 @@ class LIME(Explanation):
                 # for continuous features, sample from a normal distribution
                 # NOTE: this does not take into account correlation between variables
                 # however for sufficiently small perturbations, this may be reasonable
-                std_dev = np.std(self.X_values[:, i])
                 n_X[:, i] = np.random.normal(
-                    loc=explain_X[i], scale=std_dev, size=num_samples
+                    loc=explain_X[i], scale=std_devs[i], size=num_samples
                 )
 
         # get model predictions on perturbed data
         n_y = self.f(n_X)
 
-        # compute euclidean distances for continuous features
+        # compute normalized euclidean distances for continuous features
         # and hamming distance for categorical features
-        distances = np.zeros(num_samples)
-        for i in range(self.d):
-            if self.categorical[i]:
-                distances += (n_X[:, i] != explain_X[i]).astype(int)
-            else:
-                distances += (n_X[:, i] - explain_X[i]) ** 2
-        distances = np.sqrt(distances)
+        distances = generalized_distance(explain_X, n_X, self.categorical, std_devs)
 
         return n_X, n_y, distances
 
-    def explain_local(self, explain_idx, relevant_features=10, num_samples=5000):
+    def explain_local(self, x_explain, relevant_features=10, num_samples=5000):
         """
         Produce LIME plots for all features for a given observation.
         """
-        # check explain_idx is int
-        if not isinstance(explain_idx, int):
-            raise ValueError("explain_idx must be an integer.")
+        # check dimension of x_explain
+        if x_explain.ndim != 1 or x_explain.shape[0] != self.d:
+            raise ValueError(f"x_explain must be a 1-D array of length {self.d}.")
 
         n_features = self.X.shape[1]
-        explain_X = self.X_values[explain_idx, :]
-        explain_X = explain_X.reshape(-1, 1)
+        explain_X = x_explain.reshape(-1, 1)
         actual_prediction = self.f(explain_X.T)[0]
 
         # generate perturbed data

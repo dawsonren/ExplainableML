@@ -7,19 +7,37 @@ from ale.shared import (
     calculate_edges,
     calculate_bins_2d,
     calculate_K,
+    linear_interpolation,
+    interpolate_g_values,
+    find_path_containing_observation,
+    find_nearest_neighbor,
+    calculate_bin_index,
 )
-from ale.tree_partitioning import generate_connected_paths
+from ale.tree_partitioning import (
+    generate_connected_kdforest_and_paths,
+    ConnectedKDForest,
+)
 
 
-def _ale_main_vim(f, X, feature_idx, bins, categorical):
+def _ale_main_vim(f, X, feature_idx, bins, categorical, interpolate=True):
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n = len(x)
     edges, curve = _ale_1d(f, X, feature_idx, bins=bins, categorical=categorical)
 
     k_x, _ = calculate_bins(x, edges, categorical)
-
-    return (1 / n) * sum([curve[k_x[i] - 1] ** 2 for i in range(n)])
+    if interpolate:
+        interpolated_values = linear_interpolation(
+            x,
+            edges[k_x - 1],
+            edges[np.where(k_x == calculate_K(edges, categorical), k_x - 1, k_x)],
+            curve[k_x - 1],
+            # NOTE: for observations in the last bin, use the value at the left edge
+            curve[np.where(k_x == calculate_K(edges, categorical), k_x - 1, k_x)],
+        )
+        return (1 / n) * sum([interpolated_values[i] ** 2 for i in range(n)])
+    else:
+        return (1 / n) * sum([curve[k_x[i] - 1] ** 2 for i in range(n)])
 
 
 def _ale_interaction_vim(f, X, feature_idx, bins, categorical):
@@ -124,8 +142,8 @@ def _diagnostic_statistic(f, X, bins, categorical):
     return r_squared
 
 
-def generate_quantile_delta_values(L, K, deltas, k_x):
-    deltas_by_path = np.zeros((L, K))
+def __generate_quantile_delta_values(L, K, deltas, k_x):
+    paths = np.zeros((L, K))
     for k in range(1, K + 1):
         delta_k = deltas[k_x == k]
         if len(delta_k) == 0:
@@ -133,12 +151,14 @@ def generate_quantile_delta_values(L, K, deltas, k_x):
         for l in range(1, L + 1):
             u = (l - (1 / 2)) / L
             # compute the u-quantile of the deltas for bin k
-            deltas_by_path[l - 1, k - 1] = np.quantile(delta_k, u)
+            paths[l - 1, k - 1] = np.quantile(delta_k, u)
 
-    return deltas_by_path
+    return paths
 
 
-def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=None, interpolate=False):
+def _ale_total_vim(
+    f, X, feature_idx, bins, categorical, method="connected", interpolate=True
+):
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n = len(x)
@@ -154,7 +174,9 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
 
     # collect deltas along paths ordered by total effect size
     if method == "connected":
-        paths = generate_connected_paths(X, feature_idx, edges, deltas, categorical)
+        forest, paths = generate_connected_kdforest_and_paths(
+            X, feature_idx, edges, deltas, categorical
+        )
         deltas_by_path = np.zeros((L, K))
         # average across paths with multiple elements
         for l, path in enumerate(paths):
@@ -162,7 +184,8 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
                 deltas_by_path[l, k] = np.mean(deltas[interval])
     else:
         paths = None
-        deltas_by_path = generate_quantile_delta_values(L, K, deltas, k_x)
+        forest = None
+        deltas_by_path = __generate_quantile_delta_values(L, K, deltas, k_x)
 
     if categorical:
         # pad zero at beginning of path and remove zero at end of path
@@ -174,42 +197,85 @@ def _ale_total_vim(f, X, feature_idx, method="connected", bins=10, categorical=N
 
     # accumulate and center
     g_values = deltas_by_path.cumsum(axis=1)
-    if interpolate:
+    if interpolate and k_bar < K:
         # assume that g behaves approximately linearly between bin points
-        weight = (x.mean() - edges[k_bar - 1]) / (edges[k_bar] - edges[k_bar - 1])
-        if feature_idx == 1:
-            print('x_bar', x.mean(), 'set to', edges[k_bar] * weight + edges[k_bar - 1] * (1 - weight))
-        centered_g_values = g_values - (weight * g_values[:, k_bar] + (1 - weight) * g_values[:, k_bar - 1])[:, None]
+        centered_g = linear_interpolation(
+            x.mean(),
+            edges[k_bar - 1],
+            edges[k_bar],
+            g_values[:, k_bar - 1],
+            g_values[:, k_bar],
+        )[:, None]
+        centered_g_values = g_values - centered_g
     else:
-        if feature_idx == 1:
-            print('x_bar', x.mean(), 'rounded to', edges[k_bar-1], edges)
+        # if at last bin, just use last bin value, even if interpolating
         centered_g_values = g_values - g_values[:, k_bar - 1][:, None]
 
-    if feature_idx == 1:
-        print('E[X^2] estimated on edges: ', (edges ** 2).mean())
-
     # find variance over paths/observations
-    average_g_value = (1 / n) * (centered_g_values * (N_k / L)).sum()
-    ale_vim = (1 / n) * ((centered_g_values - average_g_value) ** 2 * (N_k / L)).sum()
+    if method == "connected" and interpolate:
+        interpolated_centered_g_values = interpolate_g_values(
+            edges, paths, k_x, x, centered_g_values, categorical[idx]
+        )
+        average_g_value = np.mean(interpolated_centered_g_values)
+        ale_vim = np.mean(np.power(interpolated_centered_g_values, 2))
+    else:
+        # treat the g value of each x_j observation as the same if they
+        # belong to the same bin
+        average_g_value = (1 / n) * (centered_g_values * (N_k / L)).sum()
+        ale_vim = (1 / n) * (
+            (centered_g_values - average_g_value) ** 2 * (N_k / L)
+        ).sum()
 
-    return ale_vim, paths, centered_g_values
+    return ale_vim, forest, paths, centered_g_values
 
 
-def _ale_local_vim(X, paths, feature_idx, explain_idx, centered_g_values, bins=10, categorical=None):
+def _ale_local_vim(
+    X,
+    paths,
+    feature_idx,
+    x_explain,
+    centered_g_values,
+    bins,
+    categorical,
+    forest: ConnectedKDForest,
+    method="tree",
+    interpolate=True,
+):
     idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
 
     edges = calculate_edges(x, bins, categorical[idx])
     k_x, _ = calculate_bins(x, edges, categorical[idx])
+    K = calculate_K(edges, categorical[idx])
+    k_explain = calculate_bin_index(x_explain[idx], edges, K, categorical[idx])
 
-    # find the index of the path containing the observation to explain
-    path_idx = None
-    for l, path in enumerate(paths):
-        for interval in path:
-            if explain_idx in interval:
-                path_idx = l
-                break
-        if path_idx is not None:
-            break
+    if method == "nn":
+        x_nn, _ = find_nearest_neighbor(
+            x_explain, feature_idx, X[k_x == k_explain, :], categorical
+        )
+    elif method == "tree":
+        x_nn = forest.route_and_pick_representative(x_explain, X, "closest_l2")[
+            "representative_x"
+        ]
 
-    return centered_g_values[path_idx, k_x[explain_idx] - 1], edges, centered_g_values[path_idx, :]
+    # find index of observation to explain
+    explain_idx = np.where((X == x_nn).all(axis=1))[0][0]
+
+    # find path containing observation to explain
+    path_idx = find_path_containing_observation(paths, explain_idx)
+
+    # interpolate along the chosen path, using the value of x_explain
+    if interpolate:
+        return (
+            linear_interpolation(
+                x_explain[idx],
+                edges[k_x[explain_idx] - 1],
+                edges[k_x[explain_idx]],
+                centered_g_values[path_idx, k_x[explain_idx] - 1],
+                centered_g_values[path_idx, k_x[explain_idx]],
+            )
+            if k_x[explain_idx] < K
+            else centered_g_values[path_idx, k_x[explain_idx] - 1]
+        )
+    else:
+        return centered_g_values[path_idx, k_x[explain_idx] - 1]

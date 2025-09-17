@@ -2,6 +2,63 @@ import numpy as np
 from sklearn.manifold import MDS
 import pandas as pd
 
+from utils import generalized_distance
+
+
+def linear_interpolation(x, x0, x1, y0, y1):
+    return y0 + np.divide(
+        (y1 - y0), (x1 - x0), out=np.zeros_like(y0), where=(x1 - x0) != 0
+    ) * (x - x0)
+
+
+def find_path_containing_observation(paths, explain_idx):
+    # find the index of the path containing the observation to explain
+    path_idx = None
+    for l, path in enumerate(paths):
+        for interval in path:
+            if explain_idx in interval:
+                path_idx = l
+                break
+        if path_idx is not None:
+            break
+    return path_idx
+
+
+def map_observation_to_path(paths, n):
+    # map each observation to the index of the path containing it
+    observation_to_path = np.zeros(n, dtype=int)
+    for l, path in enumerate(paths):
+        observation_to_path[np.concatenate(path)] = l
+    return observation_to_path
+
+
+def interpolate_g_values(edges, paths, k_x, x, centered_g_values, categorical):
+    n = len(x)
+    K = calculate_K(edges, categorical)
+    interpolated_centered_g_values = np.zeros(n)
+    l_x = map_observation_to_path(paths, n)
+    interpolated_centered_g_values = linear_interpolation(
+        x,
+        edges[k_x - 1],
+        edges[np.where(k_x == K, k_x - 1, k_x)],
+        centered_g_values[l_x, k_x - 1],
+        # NOTE: for observations in the last bin, use the value at the left edge
+        centered_g_values[l_x, np.where(k_x == K, k_x - 1, k_x)],
+    )
+    return interpolated_centered_g_values
+
+
+def find_nearest_neighbor(x, feature_idx, x_array, categorical):
+    # find the index of the nearest neighbor in x_array for x
+    idx = feature_idx - 1  # convert to 0-based index
+    # compute generalized distances, ignoring the feature at idx
+    # since it is the feature being explained
+    distances = generalized_distance(
+        x, x_array, categorical, np.std(x_array, axis=0), ignored_variables={idx}
+    )
+    nearest_idx = np.argmin(distances)
+    return x_array[nearest_idx], nearest_idx
+
 
 def calculate_K(edges, categorical=False):
     if categorical:
@@ -26,15 +83,17 @@ def calculate_edges(x, bins, categorical=False):
     return edges
 
 
+def calculate_bin_index(x, edges, K, categorical=False):
+    if categorical:
+        return np.searchsorted(edges, x) + 1
+    else:
+        return np.clip(1, np.searchsorted(edges, x, side="right").astype(int), K)
+
+
 def calculate_bins(x, edges, categorical=False):
     K = calculate_K(edges, categorical)
-    n = len(x)
     # calculate bin for each observation
-    k_x = np.zeros(n, dtype=int)
-    if categorical:
-        k_x = np.searchsorted(edges, x) + 1
-    else:
-        k_x = np.clip(1, np.searchsorted(edges, x, side="right").astype(int), K)
+    k_x = calculate_bin_index(x, edges, K, categorical)
 
     # calculate observations per bin
     N_k = np.zeros(K)

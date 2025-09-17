@@ -36,7 +36,7 @@ def check_in_confidence_interval(samples, theoretical_value, alpha=0.05):
     return lower_bound <= theoretical_value <= upper_bound
 
 
-class TestALEVIMs(unittest.TestCase): 
+class TestALEVIMs(unittest.TestCase):
     def uniform_data(self, n, sigma=0.5):
         X = generate_2d_data_uniform(n, sigma)
 

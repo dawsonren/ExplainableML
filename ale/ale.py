@@ -15,12 +15,19 @@ from ale.ale_vim import (
     _ale_total_vim,
     _ale_local_vim,
 )
-from utils import Explanation
+from utils import Explanation, bin_selection
 
 
 class ALE(Explanation):
     def __init__(
-        self, f, X, feature_names=None, bins=10, categorical=None, verbose=True
+        self,
+        f,
+        X,
+        feature_names=None,
+        bins=None,
+        categorical=None,
+        verbose=True,
+        interpolate=True,
     ):
         """
         Initialize the ALE object.
@@ -35,8 +42,12 @@ class ALE(Explanation):
         """
         super().__init__(f, X, feature_names, categorical)
 
-        self.bins = bins
+        if bins is None:
+            self.bins = bin_selection(self.n)
+        else:
+            self.bins = bins
         self.verbose = verbose
+        self.interpolate = interpolate
         # wrap f to handle categorical feature conversion
         self.f = self._wrap_convert_function(self.f)
         # takes index of predictor to a dictionary of label to numerical label
@@ -48,6 +59,8 @@ class ALE(Explanation):
 
         # keep track of connected paths from total connected VIM
         self.connected_paths = {}
+        # keep track of connected forest from total connected VIM
+        self.connected_forest = {}
         # keep track of centered g-values from total connected VIM
         self.centered_g_values = {}
 
@@ -325,7 +338,7 @@ class ALE(Explanation):
             self.f, self.X_values, bins=self.bins, categorical=self.categorical
         )
 
-    def ale_total_vim(self, feature, method="connected", interpolate=False):
+    def ale_total_vim(self, feature, method="connected"):
         """
         Calculate the total ALE VIM for a given feature index (1-based).
 
@@ -340,22 +353,23 @@ class ALE(Explanation):
         if method not in ["connected", "quantile"]:
             raise ValueError("Method must be either 'connected' or 'quantile'.")
 
-        total_vim, paths, centered_g_values = _ale_total_vim(
+        total_vim, forest, paths, centered_g_values = _ale_total_vim(
             self.f,
             self.X_values,
             idx + 1,
+            self.bins,
+            self.categorical,
             method=method,
-            bins=self.bins,
-            categorical=self.categorical,
-            interpolate=interpolate
+            interpolate=self.interpolate,
         )
         # store the generated paths for potential reuse
         if method == "connected":
             self.connected_paths[idx] = paths
+            self.connected_forest[idx] = forest
             self.centered_g_values[idx] = centered_g_values
         return total_vim
 
-    def explain(self, include=("main", "total_quantile", "total_connected"), interpolate=False):
+    def explain(self, include=("main", "total_quantile", "total_connected")):
         """
         Generate VIM explanations for all features in the dataset.
 
@@ -387,11 +401,11 @@ class ALE(Explanation):
                 explanation_i["main"] = np.sqrt(self.ale_main_vim(i + 1))
             if "total_quantile" in include:
                 explanation_i["total_quantile"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="quantile", interpolate=interpolate)
+                    self.ale_total_vim(i + 1, method="quantile")
                 )
             if "total_connected" in include:
                 explanation_i["total_connected"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="connected", interpolate=interpolate)
+                    self.ale_total_vim(i + 1, method="connected")
                 )
             if "interaction" in include:
                 explanation_i["interaction"] = np.sqrt(self.ale_interaction_vim(i + 1))
@@ -402,36 +416,39 @@ class ALE(Explanation):
         df.set_index(pd.Index(include), inplace=True)
         return df
 
-    def explain_local(self, explain_idx):
+    def explain_local(self, x_explain, method="tree"):
         """
         Produce ALE local variable importances for all features for a given observation.
         """
-        # check explain_idx is int
-        if not isinstance(explain_idx, int):
-            raise ValueError("explain_idx must be an integer.")
-        
+        # check dimension of x_explain
+        if x_explain.ndim != 1 or x_explain.shape[0] != self.d:
+            raise ValueError(f"x_explain must be a 1-D array of length {self.d}.")
+        # check method
+        if method not in ["tree", "nn"]:
+            raise ValueError("method must be either 'tree' or 'nn'.")
+
         explanations = {}
-        edges_lst = []
-        centered_g_list = []
         for i in range(self.d):
             if self.verbose:
                 print(
                     f"Generating local explanation for feature {i + 1} ({self.feature_names[i]})"
                 )
-            if i not in self.connected_paths:
+            if i not in self.connected_paths or i not in self.connected_forest:
                 raise ValueError(
-                    f"Connected paths for feature index {i + 1} not found. Please run ale_total_vim with method='connected' first."
+                    f"Connected paths/forest for feature index {i + 1} not found. Please run ale_total_vim with method='connected' first."
                 )
-            local_vim, edges, centered_g = _ale_local_vim(
+            local_vim = _ale_local_vim(
                 self.X_values,
                 self.connected_paths[i],
                 i + 1,
-                explain_idx,
+                x_explain,
                 self.centered_g_values[i],
                 self.bins,
-                self.categorical
+                self.categorical,
+                forest=self.connected_forest[i],
+                method=method,
+                interpolate=self.interpolate,
             )
             explanations[self.feature_names[i]] = local_vim
-            edges_lst.append(edges)
-            centered_g_list.append(centered_g)
-        return explanations, edges_lst, centered_g_list
+
+        return explanations
