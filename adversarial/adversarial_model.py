@@ -25,10 +25,6 @@ class AdversarialModel:
         pred_f = self.f.predict_proba(X)
         pred_psi = self.psi.predict_proba(X)
 
-        # in the case that we're only considering numerical columns
-        if self.numerical_cols:
-            X = X[:, self.numerical_cols]
-
         # allow threshold for confidence in perturbation detection
         pred_probs = self.ood_classifier.predict_proba(X)
         ood = (pred_probs[:, 1] >= ood_confidence_threshold).astype(int)
@@ -47,19 +43,11 @@ class AdversarialModel:
 
 
 class AdversarialSHAPModel(AdversarialModel):
-    """SHAP adversarial model.  Generates an adversarial model for SHAP style explainers using the Adversarial Model
-        base class.
-
-        Parameters:
-        - f : biased model
-    - psi : innocuous model
-        - perturbation_std : standard deviation of Gaussian noise added to create perturbations
-    """
-
     def __init__(self, f, psi, categorical, perturbation_std=0.3):
         super().__init__(f, psi)
         self.perturbation_std = perturbation_std
         self.categorical = categorical
+        self.ood_classifier = None
 
     def train_ood_classifier(
         self,
@@ -68,37 +56,33 @@ class AdversarialSHAPModel(AdversarialModel):
         rf_estimators=100,
         estimator=None,
     ):
-        all_x, all_y = [], []
-
-        # loop over perturbation data to create larger data set
-        for _ in range(perturbation_multiplier):
-            perturbed_xtrain = np.random.normal(0, self.perturbation_std, size=X.shape)
-            p_train_x = np.vstack((X, X + perturbed_xtrain))
-            p_train_y = np.concatenate((np.ones(X.shape[0]), np.zeros(X.shape[0])))
-
-            all_x.append(p_train_x)
-            all_y.append(p_train_y)
-
-        all_x = np.vstack(all_x)
-        all_y = np.concatenate(all_y)
-
-        if all(self.categorical):
-            raise NotImplementedError(
-                "We currently only support numerical column data. If your data set is all categorical, consider using SHAP adversarial model."
-            )
-
-        # generate perturbation detection model as RF
-        xtrain = all_x[:, self.numerical_cols]
-        xtrain, xtest, ytrain, ytest = train_test_split(xtrain, all_y, test_size=0.2)
+        print("Training OOD classifier...")
+        n = X.shape[0] * perturbation_multiplier
+        # generate augmented data, label perturbed data as 1, original data as 0
+        # only perturb continuous features
+        x_augmented = np.vstack(
+            np.repeat(X.values[:, ~np.array(self.categorical)], perturbation_multiplier, axis=0),
+            np.repeat(X.values[:, ~np.array(self.categorical)], perturbation_multiplier, axis=0),
+        )
+        y_augmented = np.hstack(
+            np.zeros(n),
+            np.ones(n),
+        )
+        noise = np.random.normal(
+            loc=0,
+            scale=self.perturbation_std,
+            size=x_augmented[n:, :].shape
+        )
+        # only add noise to the bottom part of the array (the perturbed data)
+        x_augmented[n:, ~np.array(self.categorical)] += noise
+        
+        xtrain, xtest, ytrain, ytest = train_test_split(x_augmented, y_augmented, test_size=0.2)
 
         if estimator is not None:
-            self.perturbation_identifier = estimator.fit(xtrain, ytrain)
+            self.ood_classifier = estimator.fit(xtrain, ytrain)
         else:
-            self.perturbation_identifier = RandomForestClassifier(
+            self.ood_classifier = RandomForestClassifier(
                 n_estimators=rf_estimators
             ).fit(xtrain, ytrain)
-
-        ypred = self.perturbation_identifier.predict(xtest)
-        self.ood_training_task_ability = (ytest, ypred)
-
-        return self
+        
+        print(f"OOD classifier accuracy: {self.ood_classifier.score(xtest, ytest)}")
