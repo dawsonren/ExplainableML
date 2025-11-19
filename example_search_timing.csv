@@ -1,0 +1,2 @@
+n,p,rho,sigma_eps,f_index,ale_tree_time,ale_local_time,shap_local_time,hyperparameters_nn,hyperparameters_rf,hyperparameters_gb
+100,3,0.99,0.5,3,0.032120133285449506,0.00026120009100465944,0.0023733259147937914,"{'activation': 'tanh', 'alpha': 0.0001, 'hidden_layer_sizes': (60, 60), 'learning_rate': 'constant', 'max_iter': 1000, 'solver': 'adam'}","{'max_depth': 6, 'n_estimators': 100}","{'learning_rate': 0.01, 'max_depth': 2, 'n_estimators': 300}"

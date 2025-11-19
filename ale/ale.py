@@ -24,10 +24,12 @@ class ALE(Explanation):
         f,
         X,
         feature_names=None,
-        bins=None,
+        K=None,
+        L=None,
         categorical=None,
         verbose=True,
         interpolate=True,
+        centering="x"
     ):
         """
         Initialize the ALE object.
@@ -42,13 +44,22 @@ class ALE(Explanation):
         """
         super().__init__(f, X, feature_names, categorical)
 
-        if bins is None:
-            self.bins = bin_selection(self.n)
-        else:
-            self.bins = bins
+        self.K = bin_selection(self.n) if K is None else K
+        self.L = self.n // self.K if L is None else L
+
+        if self.K >= self.n / 2:
+            print(
+                f"Warning: Number of bins ({self.K}) is too large for the dataset size ({self.n}). Consider reducing the number of bins."
+            )
+
+        if centering not in ["x", "y"]:
+            raise ValueError("centering must be either 'x' or 'y'.")
+
         self.verbose = verbose
         self.interpolate = interpolate
+        self.centering = centering
         # wrap f to handle categorical feature conversion
+        self.original_f = f
         self.f = self._wrap_convert_function(self.f)
         # takes index of predictor to a dictionary of label to numerical label
         self.label_to_num = {}
@@ -61,8 +72,14 @@ class ALE(Explanation):
         self.connected_paths = {}
         # keep track of connected forest from total connected VIM
         self.connected_forest = {}
+        # keep track of g-values from total connected VIM
+        self.g_values = {}
         # keep track of centered g-values from total connected VIM
         self.centered_g_values = {}
+        # keep track of edges, populated by ale_total_vim
+        self.edges = {}
+        # keep track of path for each observation for each feature
+        self.observation_to_path = {}
 
     def _wrap_convert_function(self, f):
         """
@@ -131,7 +148,7 @@ class ALE(Explanation):
             self.f,
             self.X_values,
             idx + 1,
-            bins=self.bins,
+            bins=self.K,
             categorical=self.categorical[idx],
         )
         # convert edges to original labels if categorical
@@ -186,7 +203,7 @@ class ALE(Explanation):
             self.X_values,
             idx_1 + 1,
             idx_2 + 1,
-            bins=self.bins,
+            bins=self.K,
             categorical_1=self.categorical[idx_1],
             categorical_2=self.categorical[idx_2],
         )
@@ -307,7 +324,7 @@ class ALE(Explanation):
             self.f,
             self.X_values,
             idx + 1,
-            bins=self.bins,
+            bins=self.K,
             categorical=self.categorical[idx],
         )
 
@@ -324,7 +341,7 @@ class ALE(Explanation):
         idx = self._get_feature_index(feature)
 
         return _ale_interaction_vim(
-            self.f, self.X_values, idx + 1, bins=self.bins, categorical=self.categorical
+            self.f, self.X_values, idx + 1, self.K, categorical=self.categorical
         )
 
     def diagnostic_statistic(self):
@@ -334,9 +351,10 @@ class ALE(Explanation):
         Returns:
         - The R^2 statistic value.
         """
-        return _diagnostic_statistic(
-            self.f, self.X_values, bins=self.bins, categorical=self.categorical
-        )
+        # TODO: this is wrong!
+        # return _diagnostic_statistic(
+        #     self.f, self.X_values, self.K, categorical=self.categorical
+        # )
 
     def ale_total_vim(self, feature, method="connected"):
         """
@@ -353,20 +371,26 @@ class ALE(Explanation):
         if method not in ["connected", "quantile"]:
             raise ValueError("Method must be either 'connected' or 'quantile'.")
 
-        total_vim, forest, paths, centered_g_values = _ale_total_vim(
+        total_vim, forest, paths, g_values, centered_g_values, edges, observation_to_path = _ale_total_vim(
             self.f,
             self.X_values,
             idx + 1,
-            self.bins,
+            self.K,
+            self.L,
             self.categorical,
+            self.label_to_num,
             method=method,
-            interpolate=self.interpolate,
+            interpolate=self.interpolate and not self.categorical[idx],
+            centering=self.centering
         )
         # store the generated paths for potential reuse
         if method == "connected":
             self.connected_paths[idx] = paths
             self.connected_forest[idx] = forest
+            self.g_values[idx] = g_values
             self.centered_g_values[idx] = centered_g_values
+            self.edges[idx] = edges
+            self.observation_to_path[idx] = observation_to_path
         return total_vim
 
     def explain(self, include=("main", "total_quantile", "total_connected")):
@@ -426,6 +450,9 @@ class ALE(Explanation):
         # check method
         if method not in ["tree", "nn"]:
             raise ValueError("method must be either 'tree' or 'nn'.")
+        # convert x_explain to numpy array if it's a pandas Series
+        if isinstance(x_explain, pd.Series):
+            x_explain = x_explain.values
 
         explanations = {}
         for i in range(self.d):
@@ -439,16 +466,97 @@ class ALE(Explanation):
                 )
             local_vim = _ale_local_vim(
                 self.X_values,
-                self.connected_paths[i],
                 i + 1,
                 x_explain,
                 self.centered_g_values[i],
-                self.bins,
+                self.K,
                 self.categorical,
+                self.observation_to_path[i],
                 forest=self.connected_forest[i],
                 method=method,
-                interpolate=self.interpolate,
+                interpolate=self.interpolate and not self.categorical[i],
             )
             explanations[self.feature_names[i]] = local_vim
 
         return explanations
+
+    def plot_connected_paths(self, feature_1, feature_2):
+        """
+        Plot the connected paths for a pair of feature indices (1-based).
+
+        Parameters:
+        - feature_1: 1-based index or feature name of the examined feature.
+        - feature_2: 1-based index or feature name of the secondary feature (plotted on y axis)
+        """
+        idx_1 = self._get_feature_index(feature_1)
+        idx_2 = self._get_feature_index(feature_2)
+        if idx_1 == idx_2:
+            raise ValueError("Feature indices must be different for connected paths plot.")
+
+        if idx_1 not in self.connected_paths or idx_2 not in self.connected_paths:
+            raise ValueError(
+                f"Connected paths for feature indices {idx_1 + 1} and/or {idx_2 + 1} not found. Please run ale_total_vim with method='connected' first."
+            )
+
+        paths = self.connected_paths[idx_1]
+        if not paths:
+            raise ValueError(
+                f"No connected path found between features {idx_1 + 1} and {idx_2 + 1}."
+            )
+
+        X = self.X_values
+        # show the connected paths
+        plt.scatter(X[:, idx_1], X[:, idx_2], alpha=0.3)
+        for path in paths:
+            # technically the averaging happens within intervals, but this is fine
+            flat_path = [item for interval in path for item in interval]
+            plt.plot(X[flat_path, idx_1], X[flat_path, idx_2])
+
+        plt.xlabel(f"{self.feature_names[idx_1]}")
+        plt.ylabel(f"{self.feature_names[idx_2]}")
+        plt.title(
+            f"Connected Paths for {self.feature_names[idx_1]}"
+        )
+
+    def plot_ale_ice(self, feature, centered=True):
+        idx = self._get_feature_index(feature)
+        categorical = self.categorical[idx]
+
+        # check if connected paths and g_values exist
+        if idx not in self.connected_paths or idx not in self.connected_forest:
+            raise ValueError(
+                f"Connected paths/forest for feature index {idx + 1} not found. Please run ale_total_vim with method='connected' first."
+            )
+
+        # get centered g_values
+        y_axis = self.centered_g_values[idx] if centered else self.g_values[idx]
+        edges = self.edges[idx]
+        # plot versus feature edges
+        for l in range(len(y_axis)):
+            # if categorical, plot as bar chart
+            if categorical:
+                # map back to original category labels
+                original_edges = [self.num_to_label[idx][int(e)] for e in edges]
+                plt.bar(original_edges, y_axis[l, :], width=0.5, align="center", alpha=0.7)
+                # draw horizontal line at y=0
+                plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
+            else:
+                # plot 
+                plt.plot(edges, y_axis[l, :], color="blue", alpha=0.8)
+        plt.xlabel(f"{self.feature_names[idx]}")
+        plt.ylabel("Centered g-values")
+        plt.title(
+            f"Centered g-values for {self.feature_names[idx]}"
+        )
+        # plot horizontal lines at edges
+        if not categorical:
+            for e in edges:
+                plt.axvline(x=e, color="black", linestyle="--", alpha=0.4)
+    
+
+# Bootstrap ALE is just like ALE but subsamples the data with replacement
+# to create multiple explanations. We hope that this reduces variance in the
+# explanations.
+class BootstrapALE(ALE):
+    def __init__(self):
+        super().__init__()

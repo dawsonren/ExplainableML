@@ -48,7 +48,7 @@ def interpolate_g_values(edges, paths, k_x, x, centered_g_values, categorical):
     return interpolated_centered_g_values
 
 
-def find_nearest_neighbor(x, feature_idx, x_array, categorical):
+def find_nearest_neighbor(x, feature_idx, x_array, categorical, K=1):
     # find the index of the nearest neighbor in x_array for x
     idx = feature_idx - 1  # convert to 0-based index
     # compute generalized distances, ignoring the feature at idx
@@ -56,8 +56,9 @@ def find_nearest_neighbor(x, feature_idx, x_array, categorical):
     distances = generalized_distance(
         x, x_array, categorical, np.std(x_array, axis=0), ignored_variables={idx}
     )
-    nearest_idx = np.argmin(distances)
-    return x_array[nearest_idx], nearest_idx
+    # get the K nearest neighbors
+    nearest_idxs = np.argpartition(distances, K)[:K]
+    return x_array[nearest_idxs], nearest_idxs
 
 
 def calculate_K(edges, categorical=False):
@@ -68,16 +69,16 @@ def calculate_K(edges, categorical=False):
     return K
 
 
-def calculate_edges(x, bins, categorical=False):
+def calculate_edges(x, K, categorical=False):
     if categorical:
         # set to sorted unique values
         edges = np.sort(np.unique(x))
     else:
-        bins = min(
-            bins, np.unique(x).size - 1
+        K = min(
+            K, np.unique(x).size - 1
         )  # ensure bins does not exceed unique values
         # equal-mass bin edges
-        edges = np.quantile(x, np.linspace(0, 1, bins + 1))
+        edges = np.quantile(x, np.linspace(0, 1, K + 1))
         edges = np.unique(edges)  # remove duplicates
 
     return edges

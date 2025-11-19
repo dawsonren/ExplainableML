@@ -1,6 +1,8 @@
+import math
+
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
 
 
 class Explanation:
@@ -70,6 +72,8 @@ class Explanation:
             if log:
                 for i in range(X_values.shape[0]):
                     self.query_log.add(tuple(X_values[i, :]))
+            if self.is_dataframe and isinstance(X, np.ndarray):
+                X = pd.DataFrame(X, columns=self.feature_names)
             return f(X)
 
         return wrapper
@@ -85,11 +89,20 @@ class Explanation:
 
 
 def bin_selection(n):
-    # choose closest divisor to sqrt(n)
-    # list of divisors of n
-    divisors = [i for i in range(1, n + 1) if n % i == 0]
-    closest_divisor = min(divisors, key=lambda x: abs(x - np.sqrt(n)))
-    return closest_divisor
+    root = math.sqrt(n)
+
+    # For small n, just use the rounded square root
+    if n <= 100:
+        return int(round(root))
+
+    # For larger n, pick the closest multiple of 10 to sqrt(n)
+    nice = int(round(root / 10.0)) * 10
+
+    # Just in case something weird happens, fall back to rounded sqrt
+    if nice <= 0:
+        nice = int(round(root))
+
+    return nice
 
 
 def generalized_distance(x, X, categorical, std_devs, ignored_variables=None):

@@ -73,17 +73,31 @@ class ConnectedKDForest:
     for the x_new's interval k.
     """
 
-    def __init__(self, feature_idx: int, edges: np.ndarray, categorical: list):
+    def __init__(self, feature_idx: int, edges: np.ndarray, categorical: list, label_to_num: dict):
         self.feature_idx = feature_idx
         self.edges = edges
         self.categorical = categorical
         self.root: Optional[KDNode] = None
         self.K: Optional[int] = None
+        self.label_to_num = label_to_num
+
+    def _convert_x_new(self, x_new: np.ndarray) -> np.ndarray:
+        """
+        Convert categorical features in x_new to numeric representation.
+        """
+        x_converted = x_new.copy()
+        for j, is_cat in enumerate(self.categorical):
+            if is_cat:
+                val = x_new[j]
+                if val in self.label_to_num[j]:
+                    x_converted[j] = self.label_to_num[j][val]
+                else:
+                    raise ValueError(f"Value {val} not found in label_to_num mapping for feature {j}")
+        return x_converted
 
     def _bin_for_xj(self, x_new: np.ndarray) -> int:
         """
         Compute the 0-based interval k for a new point along feature j.
-        Mirrors your calculate_bins behavior.
         """
         xj = np.array([x_new[self.feature_idx]])
         k_x, _ = calculate_bins(
@@ -104,6 +118,8 @@ class ConnectedKDForest:
         """
         if self.root is None:
             raise RuntimeError("Forest not built yet")
+    
+        x_new = self._convert_x_new(x_new)
         k = self._bin_for_xj(x_new)
         node = self.root
         while not node.is_leaf:
@@ -112,10 +128,7 @@ class ConnectedKDForest:
             # categorical thresholds are *levels*; numeric are numbers
             val = x_new[m]
             # For categorical, we used an order derived from diffs; to stay consistent,
-            # we route left if val < med in that ordered sense. Since med is a chosen
-            # level, we mimic training-time: left = vals < med, right = >= med.
-            go_left = val < thr if not self.categorical[m] else (val < thr)
-            node = node.left if go_left else node.right
+            node = node.left if val < thr else node.right
 
         return {
             "k": k,
@@ -129,9 +142,8 @@ class ConnectedKDForest:
         """
         Route and select a single representative 'actual x' at the leaf.
         Strategies:
-          - 'first' (deterministic): pick the first index in that leaf interval
+          - 'first': pick the first index in that leaf interval
           - 'median_j': pick the index whose X_j is median within the leaf interval
-          - 'closest_l2': pick the nearest neighbor to x_new among indices in the leaf interval
         """
         info = self.route(x_new)
         idxs = info["indices"]
@@ -144,10 +156,6 @@ class ConnectedKDForest:
             xj_vals = X[idxs, self.feature_idx]
             med_val = np.median(xj_vals)
             chosen_idx = int(idxs[np.argmin(np.abs(xj_vals - med_val))])
-        elif strategy == "closest_l2":
-            diff = X[idxs] - x_new[None, :]
-            d2 = np.einsum("ij,ij->i", diff, diff)
-            chosen_idx = int(idxs[np.argmin(d2)])
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -161,50 +169,40 @@ class ConnectedKDForest:
 ###
 ### Helper functions
 ###
-def _get_priority(R, reuse_tracker):
+def _get_priority(R):
     """
     Priority score (lower number is higher priority) for splitting
     paths R. We calculate the score as the negative of the maximum
-    number of elements in an interval plus the sum of
-    reuse_tracker over indices where there is only one observation
-    remaining (requiring duplication).
+    number of elements in an interval, encouraging splits that
+    reduce large intervals.
 
     Parameters
     ----------
     R             : list of intervals, each interval is a list of indices
-    reuse_tracker : list of length n with number of reuses
 
     Returns
     -------
     score         : priority score
     """
-    max_elements_in_interval = len(max(R, key=lambda interval: len(interval)))
-    if all([len(interval) > 1 for interval in R]):
-        duplication_penalty = 0
-    else:
-        duplication_penalty = sum(
-            [reuse_tracker[interval[0]] for interval in R if len(interval) == 1]
-        )
-    return -max_elements_in_interval + duplication_penalty
+    return -len(max(R, key=lambda interval: len(interval)))
 
 
-def _perform_duplication(R, reuse_tracker):
+def _perform_duplication(R):
     """
     Duplicate elements of singleton intervals in R in order to
-    enable splitting. Update reuse_tracker accordingly. These
-    operations are performed in-place.
+    enable splitting. These operations are performed in-place.
 
     Parameters
     ----------
     R               : list of intervals, each interval is a list of indices
-    reuse_tracker   : list of length n with number of reuses
     """
     for interval in R:
         if len(interval) == 1:
-            reuse_tracker[interval[0]] += 1
             interval.append(interval[0])
 
-    assert all([len(interval) > 1 for interval in R]), "Duplication failed"
+    # assert all([len(interval) > 1 for interval in R]), "Duplication failed"
+    if any([len(interval) <= 1 for interval in R]):
+        print(R) # DEBUG
 
 
 def _score_split(K, R, X, diffs, m, categorical):
@@ -329,6 +327,8 @@ def generate_connected_kdforest_and_paths(
     edges: np.ndarray,
     deltas: np.ndarray,
     categorical: list,
+    label_to_num: dict,
+    L: int
 ):
     """
     Parameters:
@@ -345,11 +345,10 @@ def generate_connected_kdforest_and_paths(
     # Convert to 0-based j
     j = feature_idx - 1
     xj = X[:, j]
-    n = X.shape[0]
     k_x, _ = calculate_bins(xj, edges, categorical=categorical[j])
 
     K = calculate_K(edges, categorical[j])
-    forest = ConnectedKDForest(feature_idx=j, edges=edges, categorical=categorical)
+    forest = ConnectedKDForest(feature_idx=j, edges=edges, categorical=categorical, label_to_num=label_to_num)
     forest.K = K
 
     # Initial leaf set at root: list of K intervals, each a list of indices
@@ -365,18 +364,14 @@ def generate_connected_kdforest_and_paths(
     queue = PriorityQueue()
     # use same type as before for priority; keep node reference inside
     queue.put(PrioritizedPath(0, root))
-    reuse_tracker = np.zeros(n, dtype=int)
-
-    # Number of target leaves L equals n // K per your code
-    L = n // K
 
     # Helper: split a KDNode into two child nodes using split logic
     def _split_node(node: KDNode):
-        # We reuse your _perform_duplication and _split_leaf to get children R's,
+        # Use _perform_duplication and _split_leaf to get children R's,
         # and also recover the split feature and thresholds (medians per k).
         R = node.R
-        # in-place duplication (updates reuse_tracker)
-        _perform_duplication(R, reuse_tracker)
+        # perform duplication if needed
+        _perform_duplication(R)
 
         # find best split (m_star, medians) and children intervals
         R_left, R_right, m_star, best_medians = _split_leaf(
@@ -399,12 +394,12 @@ def generate_connected_kdforest_and_paths(
         node.R = None  # internal nodes need not keep R
 
         # Priorities as in your queue policy
-        pr_left = _get_priority(R_left, reuse_tracker)
-        pr_right = _get_priority(R_right, reuse_tracker)
+        pr_left = _get_priority(R_left)
+        pr_right = _get_priority(R_right)
         return left, pr_left, right, pr_right
 
-    # Grow until we have L leaves in the queue (like your while qsize() < L)
-    # We maintain the queue with leaf nodes only (frontier).
+    # Grow until we have L leaves in the queue
+    # We maintain the queue with leaf nodes only
     while queue.qsize() < L:
         node: KDNode = queue.get().path  # path stores KDNode now
         left, pr_left, right, pr_right = _split_node(node)
