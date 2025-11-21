@@ -6,6 +6,10 @@ Study variability of ALE and SHAP explanations on real data.
 2. Statlog (German Credit Data) Data Set
 3. Bike Sharing Demand Data Set
 """
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
@@ -13,8 +17,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from sklearn.model_selection import (
-    RandomizedSearchCV,
-    StratifiedKFold,
     KFold,
 )
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
@@ -107,10 +109,6 @@ def load_german_credit():
 def load_bike_sharing():
     """
     Load Bike Sharing Demand from UCI zip and prepare X, y.
-
-    - Uses 
-    - y = 'Rented Bike Count'
-    - Drops 'Date' column (too high cardinality for one-hot by default)
     """
     # clean data
     df = pd.read_csv("data/bikesharing.csv")
@@ -133,10 +131,7 @@ def load_bike_sharing():
     return X, y
 
 
-def main():
-    K = 3
-    REPLICATIONS = 1
-
+def run_experiments(EXPLAIN_NAME, K_FOLDS, REPLICATIONS, M, K, subsample=None):
     # # 1) Breast Cancer – classification
     # X_bc, y_bc = load_breast_cancer()
 
@@ -144,10 +139,14 @@ def main():
     # X_gc, y_gc = load_german_credit()
 
     # 3) Bike Sharing – regression
-    X_bike, y_bike = load_bike_sharing()
-    # subsample for speed
-    X_bike = X_bike.sample(n=1000, random_state=42).reset_index(drop=True)
-    y_bike = y_bike.loc[X_bike.index].reset_index(drop=True)
+    if EXPLAIN_NAME == "bike_sharing":
+        X_bike, y_bike = load_bike_sharing()
+
+    # subsample data for speed
+    if subsample is not None:
+        X_bike = X_bike.sample(n=subsample, random_state=42)
+        y_bike = y_bike.loc[X_bike.index]
+
     n, p = X_bike.shape
     est = MLPRegressor(hidden_layer_sizes=(25,), activation='logistic', alpha=0.05, max_iter=1000, random_state=42)
 
@@ -155,17 +154,17 @@ def main():
     # an explanation is a vector of length p
     # since we have K folds, we will have K explanations for each of the n data points
     # we sum over replications and will average at the end
-    shap_explanations_sum = np.zeros((K, n, p))
-    ale_explanations_sum = np.zeros((K, n, p))
+    shap_explanations_sum = np.zeros((K_FOLDS, n, p))
+    ale_explanations_sum = np.zeros((K_FOLDS, n, p))
 
     for r in range(REPLICATIONS):
         print(f"Replication {r + 1}/{REPLICATIONS}")
 
-        shap_explanations = np.zeros((K, n, p))
-        ale_explanations = np.zeros((K, n, p))
+        shap_explanations = np.zeros((K_FOLDS, n, p))
+        ale_explanations = np.zeros((K_FOLDS, n, p))
 
         # create K folds
-        kf = KFold(n_splits=K, shuffle=True, random_state=42)
+        kf = KFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
         for k, (train_index, test_index) in enumerate(kf.split(X_bike)):
             print(f"Fold {k + 1}...")
 
@@ -181,12 +180,12 @@ def main():
             for i in tqdm(range(n)):
                 # select single observation to explain
                 x_explain = X_bike.iloc[i, :]
-                shap_values = shap_explainer.explain_local(x_explain)
+                shap_values = shap_explainer.explain_local(x_explain, num_samples=M)
                 for j in range(p):
                     shap_explanations[k, i, j] = shap_values[X_bike.columns[j]]
 
             # ALE explanation
-            ale_explainer = ALE(f, X_train, verbose=False)
+            ale_explainer = ALE(f, X_train, verbose=False, centering="y")
             ale_explainer.explain()
             for i in tqdm(range(n)):
                 # select single observation to explain
@@ -202,8 +201,29 @@ def main():
     shap_explanations_avg = shap_explanations_sum / REPLICATIONS
     ale_explanations_avg = ale_explanations_sum / REPLICATIONS
 
+    slug = f"{EXPLAIN_NAME}_K{K}_M{M}_KF{K_FOLDS}_REP{REPLICATIONS}"
+
     # save explanations
-    np.savez("real_data_explanations.npz", shap=shap_explanations_avg, ale=ale_explanations_avg)
+    np.savez(f"figures/{slug}/real_data_explanations.npz", shap=shap_explanations_avg, ale=ale_explanations_avg)
 
 if __name__ == "__main__":
-    main()
+    SAVE_IMAGE = False
+    EXPLAIN_NAME = "bike_sharing"
+    K_FOLDS = 5
+    REPLICATIONS = 1
+    M = 10
+    K = 30
+
+    slug = f"{EXPLAIN_NAME}_K{K}_M{M}_KF{K_FOLDS}_REP{REPLICATIONS}"
+
+    explanations_file = f"figures/{slug}/real_data_explanations.npz"
+
+    # check if explanations already exist
+    # if so, skip computation
+    if os.path.exists(explanations_file):
+        print("Explanations already exist. Skipping computation.")
+    else:
+        # create directory if it doesn't exist
+        if not os.path.exists(f"figures/{slug}"):
+            os.makedirs(f"figures/{slug}")
+        run_experiments(EXPLAIN_NAME, K_FOLDS, REPLICATIONS, M, K)

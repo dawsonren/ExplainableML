@@ -1,25 +1,5 @@
 """
 Provide tree partitioning to create connected paths.
-The implementation for categorical variable is elaborated below.
-
-NOTE: Why can't we just rebalance the X values at the beginning?
-1. By duplicating observations in intervals that have n_j(k) < L,
-we change the median, this should be discouraged.
-2. We don't know which observations to average together in intervals
-that have n_j(k) > L.
-NOTE: I propose a two-part procedure. We always keep a priority queue
-of collections based on the largest number of observations in an interval.
-If we don't yet have L values in our heap, we duplicate any data points
-we may need. We also somehow need to keep track of how many times things have been
-duplicated already, so that we keep the distribution of our data somewhat coherent.
-Heuristically, set our priority equal to the largest observations in an interval
-PLUS the number of times this data point has already been duplicated.
-Once we obtain L values in our heap, we then perform our averaging procedure.
-This encourages averages over fewer elements, which hopefully corresponds to "closer"
-observations that are being averaged.
-
-TODO: You might want to measure the maximum distance
-between points in this group, but that feels...too complicated.
 """
 
 from typing import List, Any, Optional, Dict
@@ -105,39 +85,88 @@ class ConnectedKDForest:
         )
         # calculate_bins returns 1..K; convert to 0..K-1
         return int(k_x[0] - 1)
-
-    def route(self, x_new: np.ndarray) -> Dict[str, object]:
+    
+    def _collect_leaf_indices(self, node: Optional[KDNode], k: int) -> np.ndarray:
         """
-        Route a new point to a leaf and return useful info.
-        Returns:
-            {
-              'k': int (0-based interval for x_j),
-              'node': KDNode (the leaf),
-              'indices': np.ndarray of training indices in that leaf for interval k,
-            }
+        Collect all training indices for interval k from all leaf nodes
+        in the subtree rooted at `node`.
+        """
+        if node is None:
+            return np.array([], dtype=int)
+
+        if node.is_leaf:
+            return node.leaf_indices_for_k(k)
+
+        left_idxs = self._collect_leaf_indices(node.left, k)
+        right_idxs = self._collect_leaf_indices(node.right, k)
+
+        if left_idxs.size == 0:
+            return right_idxs
+        if right_idxs.size == 0:
+            return left_idxs
+        return np.concatenate([left_idxs, right_idxs])
+
+    def route(self, x_new: np.ndarray, levels_up: int = 0) -> Dict[str, object]:
+        """
+        Route a new point and return node info.
+
+        Args
+        ----
+        x_new : np.ndarray
+            New sample.
+        levels_up : int, default 0
+            0 -> return the leaf node (original behavior).
+            1 -> return the parent of the leaf,
+            2 -> grandparent, etc.
+            If levels_up is larger than the depth of the leaf, the root is returned.
+
+        Returns
+        -------
+        dict with keys:
+          - 'k': int
+                0-based interval for x_j.
+          - 'node': KDNode
+                The node at the requested height (may be internal or leaf).
+          - 'indices': np.ndarray
+                All training indices (for interval k) in all leaves below that node.
         """
         if self.root is None:
             raise RuntimeError("Forest not built yet")
-    
+
+        if levels_up < 0:
+            raise ValueError("levels_up must be >= 0")
+
         x_new = self._convert_x_new(x_new)
         k = self._bin_for_xj(x_new)
+
+        # Descend the tree while keeping track of the path
+        path: list[KDNode] = []
         node = self.root
         while not node.is_leaf:
+            path.append(node)
             m = node.split_feature
             thr = node.thresholds[k]
-            # categorical thresholds are *levels*; numeric are numbers
             val = x_new[m]
-            # For categorical, we used an order derived from diffs; to stay consistent,
             node = node.left if val < thr else node.right
+
+        # Include the final leaf in the path
+        path.append(node)
+
+        # Choose the node `levels_up` above the leaf, clamped at root
+        target_depth_index = max(0, len(path) - 1 - levels_up)
+        target_node = path[target_depth_index]
+
+        # Collect all indices for all leaves below target_node for interval k
+        indices = self._collect_leaf_indices(target_node, k)
 
         return {
             "k": k,
-            "node": node,
-            "indices": node.leaf_indices_for_k(k),
+            "node": target_node,
+            "indices": indices,
         }
 
     def route_and_pick_representative(
-        self, x_new: np.ndarray, X: np.ndarray, strategy: str = "first"
+        self, x_new: np.ndarray, X: np.ndarray, strategy: str = "first", levels_up: int = 0
     ) -> Dict[str, object]:
         """
         Route and select a single representative 'actual x' at the leaf.
@@ -145,7 +174,7 @@ class ConnectedKDForest:
           - 'first': pick the first index in that leaf interval
           - 'median_j': pick the index whose X_j is median within the leaf interval
         """
-        info = self.route(x_new)
+        info = self.route(x_new, levels_up=levels_up)
         idxs = info["indices"]
         if idxs.size == 0:
             raise RuntimeError("Leaf is unexpectedly empty for interval k")
@@ -200,9 +229,7 @@ def _perform_duplication(R):
         if len(interval) == 1:
             interval.append(interval[0])
 
-    # assert all([len(interval) > 1 for interval in R]), "Duplication failed"
-    if any([len(interval) <= 1 for interval in R]):
-        print(R) # DEBUG
+    assert all([len(interval) > 1 for interval in R]), "Duplication failed"
 
 
 def _score_split(K, R, X, diffs, m, categorical):
@@ -271,6 +298,11 @@ def _split_leaf(
     d = X.shape[1]
     candidate_features = [m for m in range(d) if m != j]
 
+    # assert that length of R is K
+    assert len(R) == K, "R length does not match K"
+    # also assert that length of each R[k] >= 1
+    assert all([len(interval) >= 1 for interval in R]), "Some R[k] is empty"
+
     best_obj = -np.inf
     m_star = None
     best_medians = None
@@ -318,7 +350,7 @@ def _split_leaf(
 
 ###
 ### Main algorithm
-###``
+###
 
 
 def generate_connected_kdforest_and_paths(
@@ -357,6 +389,11 @@ def generate_connected_kdforest_and_paths(
         mask = k_x == k
         # store as python lists of ints
         root_R.append(np.where(mask)[0].astype(int).tolist())
+
+    if any([len(interval) == 0 for interval in root_R]):
+        # get the index of empty intervals
+        empty_intervals = [k + 1 for k in range(K) if len(root_R[k]) == 0]
+        print(f"generate_connected_kdforest_and_paths: empty intervals found at root: {empty_intervals}")
 
     root = KDNode(split_feature=None, thresholds=None, left=None, right=None, R=root_R)
 

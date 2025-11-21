@@ -78,7 +78,7 @@ def calculate_edges(x, K, categorical=False):
             K, np.unique(x).size - 1
         )  # ensure bins does not exceed unique values
         # equal-mass bin edges
-        edges = np.quantile(x, np.linspace(0, 1, K + 1))
+        edges = np.quantile(x, np.linspace(0, 1, K), method="closest_observation")
         edges = np.unique(edges)  # remove duplicates
 
     return edges

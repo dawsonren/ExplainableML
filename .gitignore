@@ -207,3 +207,6 @@ __marimo__/
 
 # VS Code
 .vscode/
+
+# everything in figures
+figures/*

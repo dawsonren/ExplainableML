@@ -26,6 +26,7 @@ class ALE(Explanation):
         feature_names=None,
         K=None,
         L=None,
+        levels_up=None,
         categorical=None,
         verbose=True,
         interpolate=True,
@@ -46,6 +47,7 @@ class ALE(Explanation):
 
         self.K = bin_selection(self.n) if K is None else K
         self.L = self.n // self.K if L is None else L
+        self.levels_up = 0 if levels_up is None else levels_up
 
         if self.K >= self.n / 2:
             print(

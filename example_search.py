@@ -91,9 +91,10 @@ explain_f_list = [explain_f_1, explain_f_2, explain_f_3, explain_f_4]
 
 rhos = [0.9, 0.99]
 sigma_epss = [0.25, 1, 2]
-ns = [1000]
-ps = [5, 11]
-f_idxs = [0, 1, 3]
+ns = [100]
+ps = [5]
+f_idxs = [0, 1]
+levels_ups = [0, 1, 2]
 
 # rhos = [0.99]
 # sigma_epss = [0.5]
@@ -101,7 +102,7 @@ f_idxs = [0, 1, 3]
 # ps = [3]
 # f_idxs = [3] # zero-indexed
 
-REPLICATIONS = 40
+REPLICATIONS = 3
 M = 1000
 
 NN_PARAM_GRID = {
@@ -199,17 +200,18 @@ def f_factory(X, y, sigma_eps, params, type="nn", verbose=False):
         
     model.fit(X, y)
     # show R^2 on training data
+    
+    # get CV R^2
+    cv = KFold(n_splits=10, shuffle=True, random_state=42)
+    r2_scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=-1)
     if verbose:
-        # get CV R^2
-        cv = KFold(n_splits=10, shuffle=True, random_state=42)
-        r2_scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=-1)
         print(f"CV R^2 scores for ({type}): {r2_scores}, mean: {r2_scores.mean():.4f}, std: {r2_scores.std():.4f}")
         print(f"Theoretical R^2: {1 - (sigma_eps ** 2) / np.var(y):.4f}")
 
-    return lambda X: model.predict(X)
+    return lambda X: model.predict(X), r2_scores.mean()
 
-def folder_name(n, p, rho, sigma_eps, f_index):
-    return Path(f"figures/example_search/n{n}_p{p}_rho{int(rho*100)}_sigma{int(sigma_eps*100)}_f{f_index}")
+def folder_name(n, p, rho, sigma_eps, f_index, levels_up):
+    return Path(f"figures/example_search/n{n}_p{p}_rho{int(rho*100)}_sigma{int(sigma_eps*100)}_f{f_index}_lvls{levels_up}")
 
 def ale_shap_barplot(x, x_idx, p, ale_importances, shap_importances):
     features = [f"X{j+1}" for j in range(p)]
@@ -275,7 +277,7 @@ def f_variability_lineplot(x, f_values):
     plt.grid()
     plt.legend()
 
-def run_replication(n, p, f, rho, sigma_eps, params, f_index, xs, replication_index):
+def run_replication(n, p, f, rho, sigma_eps, params, f_index, levels_up, xs, replication_index):
     print(f"Running replication with n={n}, p={p}, rho={rho}, sigma_eps={sigma_eps}, f=f_{f_index + 1}")
     X, y = dgp(n, p, f, rho, sigma_eps)
 
@@ -291,18 +293,20 @@ def run_replication(n, p, f, rho, sigma_eps, params, f_index, xs, replication_in
     shap_importances = np.zeros((len(xs), p, 3))
     # also keep track of trained function f's variability at [x, -x, x, x, -x]
     f_values = np.zeros((len(xs), 3))
+    # also keep track of R^2 scores
+    r2_scores = {}
 
     X, y = dgp(n, p, f, rho, sigma_eps)
 
     for m, model_type in enumerate(["nn", "rf", "gb"]):
-        f = f_factory(X, y, sigma_eps, params[model_type], type=model_type)
-        ale_explainer = ALE(f, X, verbose=False, interpolate=True, centering="y")
+        f, r2_scores[model_type] = f_factory(X, y, sigma_eps, params[model_type], type=model_type)
+        ale_explainer = ALE(f, X, verbose=False, interpolate=True, centering="y", levels_up=levels_up)
         t = time.perf_counter()
         # scalene_profiler.start()
         ale_explainer.explain()
         # scalene_profiler.stop()
 
-        image_slug = folder_name(n, p, rho, sigma_eps, f_index + 1)
+        image_slug = folder_name(n, p, rho, sigma_eps, f_index + 1, levels_up)
 
         if not image_slug.exists():
             image_slug.mkdir(parents=True, exist_ok=True)
@@ -349,7 +353,7 @@ def run_replication(n, p, f, rho, sigma_eps, params, f_index, xs, replication_in
         "shap_local_time": time_shap_local / total_explanations
     }
 
-    return ale_importances, shap_importances, f_values, timing
+    return ale_importances, shap_importances, f_values, timing, r2_scores
 
 if __name__ == "__main__":
     print("Starting example search...")
@@ -359,8 +363,8 @@ if __name__ == "__main__":
     timing_df = []
 
     # iterate over all combinations of rhos, sigma_epss, ns, ps, fs
-    for i, (rho, sigma_eps, n, p, f_index) in enumerate(product(rhos, sigma_epss, ns, ps, f_idxs)):
-        slug = folder_name(n, p, rho, sigma_eps, f_index + 1)
+    for i, (rho, sigma_eps, n, p, f_index, levels_up) in enumerate(product(rhos, sigma_epss, ns, ps, f_idxs, levels_ups)):
+        slug = folder_name(n, p, rho, sigma_eps, f_index + 1, levels_up)
         already_done = slug.exists() and (slug / "ale_importances.npy").exists() and (slug / "shap_importances.npy").exists() and (slug / "f_values.npy").exists()
 
         if already_done:
@@ -372,7 +376,7 @@ if __name__ == "__main__":
 
         f = f_list[f_index]
         print(f"\n\n\n\n\nRunning example {i+1}/{len(rhos) * len(sigma_epss) * len(ns) * len(ps) * len(f_idxs)}")
-        print(f"Parameters: rho={rho}, sigma_eps={sigma_eps}, n={n}, p={p}, f=f_{f_index + 1}")
+        print(f"Parameters: rho={rho}, sigma_eps={sigma_eps}, n={n}, p={p}, f=f_{f_index + 1}, levels_up={levels_up}")
 
         # generate hyperparameters
         print("\n\n\nGenerating hyperparameters...")
@@ -386,15 +390,17 @@ if __name__ == "__main__":
         true_importances_list = []
         f_values_list = []
         timings_list = []
+        r2_scores_list = []
 
         for i in range(REPLICATIONS):
             print(f"Replication {i+1}/{REPLICATIONS}...")
-            ale_importances, shap_importances, f_values, timing = run_replication(n, p, f, rho, sigma_eps, params, f_index, xs, i)
+            ale_importances, shap_importances, f_values, timing, r2_scores = run_replication(n, p, f, rho, sigma_eps, params, f_index, levels_up, xs, i)
 
             ale_importances_list.append(ale_importances)
             shap_importances_list.append(shap_importances)
             f_values_list.append(f_values)
             timings_list.append(timing)
+            r2_scores_list.append(r2_scores)
 
         ale_importances_array = np.stack(ale_importances_list, axis=0)
         shap_importances_array = np.stack(shap_importances_list, axis=0)
@@ -444,15 +450,18 @@ if __name__ == "__main__":
             "rho": rho,
             "sigma_eps": sigma_eps,
             "f_index": f_index,
+            "levels_up": levels_up,
             **avg_timing,
             "hyperparameters_nn": params["nn"],
             "hyperparameters_rf": params["rf"],
-            "hyperparameters_gb": params["gb"]
+            "hyperparameters_gb": params["gb"],
+            "avg_r2_scores_nn": np.array([r2_scores_list[i]["nn"] for i in range(REPLICATIONS)]).mean(),
+            "avg_r2_scores_rf": np.array([r2_scores_list[i]["rf"] for i in range(REPLICATIONS)]).mean(),
+            "avg_r2_scores_gb": np.array([r2_scores_list[i]["gb"] for i in range(REPLICATIONS)]).mean()
         })
 
         # save timing df each iteration so we don't lose data
-        timing_df = pd.DataFrame(timing_df)
-        timing_df.to_csv("example_search_timing.csv", index=False)
+        pd.DataFrame(timing_df).to_csv("example_search_timing.csv", index=False)
 
         # clear all figures
         plt.close('all')

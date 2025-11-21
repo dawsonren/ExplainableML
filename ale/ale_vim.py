@@ -266,6 +266,7 @@ def _ale_local_vim(
     categorical,
     observation_to_path,
     forest: ConnectedKDForest,
+    levels_up: int = 0,
     method="tree",
     interpolate=True
 ):
@@ -283,7 +284,7 @@ def _ale_local_vim(
             x_explain, feature_idx, X[k_x == k_explain, :], categorical, K
         )
     elif method == "tree":
-        x_idxs = forest.route_and_pick_representative(x_explain, X)[
+        x_idxs = forest.route_and_pick_representative(x_explain, X, levels_up=levels_up)[
             "indices"
         ]
 
