@@ -1,4 +1,4 @@
-from ale.ale import ALE
+from ale.ale import ALE, BootstrapALE
 
 # export
-__all__ = ["ALE"]
+__all__ = ["ALE", "BootstrapALE"]

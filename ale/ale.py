@@ -559,6 +559,149 @@ class ALE(Explanation):
 # Bootstrap ALE is just like ALE but subsamples the data with replacement
 # to create multiple explanations. We hope that this reduces variance in the
 # explanations.
-class BootstrapALE(ALE):
-    def __init__(self):
-        super().__init__()
+class BootstrapALE(Explanation):
+    def __init__(
+        self,
+        f,
+        X,
+        replications=5,
+        feature_names=None,
+        K=None,
+        L=None,
+        levels_up=None,
+        categorical=None,
+        verbose=True,
+        interpolate=True,
+        centering="x",
+        seed=None
+    ):
+        """
+        Initialize the BootstrapALE object.
+
+        Parameters:
+        - f: The model function that takes a 2D numpy array and returns predictions.
+        - X: The input data as a 2D numpy array or pandas DataFrame.
+        - replications: Number of bootstrap replications.
+        - feature_names: List of feature names. If None and X is a DataFrame, use its columns.
+        - bins: Number of bins for ALE calculation.
+        - categorical: List of booleans indicating if each feature is categorical.
+                       If None, all features are treated as continuous.
+        """
+        super().__init__(f, X, feature_names, categorical)
+
+        self.replications = replications
+        self.K = bin_selection(self.n) if K is None else K
+        self.L = self.n // self.K if L is None else L
+        self.levels_up = 0 if levels_up is None else levels_up
+
+        if self.K >= self.n / 2:
+            print(
+                f"Warning: Number of bins ({self.K}) is too large for the dataset size ({self.n}). Consider reducing the number of bins."
+            )
+
+        if centering not in ["x", "y"]:
+            raise ValueError("centering must be either 'x' or 'y'.")
+
+        self.verbose = verbose
+        self.interpolate = interpolate
+        self.centering = centering
+        self.seed = 42 if seed is None else seed
+
+        # create ALE objects for each replication
+        if replications > 1:
+            self.ale_replications = []
+            rng = np.random.default_rng(self.seed)
+            for _ in range(self.replications):
+                # bootstrap sample with replacement
+                indices = rng.choice(self.n, size=self.n, replace=True)
+                X_bootstrap = self.X_values[indices, :]
+                ale_r = ALE(
+                    f,
+                    X_bootstrap,
+                    feature_names=self.feature_names,
+                    K=self.K,
+                    L=self.L,
+                    levels_up=self.levels_up,
+                    categorical=self.categorical,
+                    verbose=self.verbose,
+                    interpolate=self.interpolate,
+                    centering=self.centering
+                )
+                self.ale_replications.append(ale_r)
+        else:
+            self.ale_replications = [
+                ALE(
+                    f,
+                    self.X_values,
+                    feature_names=self.feature_names,
+                    K=self.K,
+                    L=self.L,
+                    levels_up=self.levels_up,
+                    categorical=self.categorical,
+                    verbose=self.verbose,
+                    interpolate=self.interpolate,
+                    centering=self.centering
+                )
+            ]
+
+    def explain(self, include=("main", "total_quantile", "total_connected")):
+        """
+        Generate VIM explanations for all features in the dataset using bootstrap replications.
+
+        Parameters:
+        - include: A tuple specifying which explanations to include.
+                   Options are 'main', 'total_quantile', 'total_connected', and 'interaction'.
+                   Default is ('main', 'total_quantile', 'total_connected').
+
+        Returns:
+        - A pandas DataFrame containing the averaged explanations for each feature.
+        """
+        explanations = {}
+        for ale_r in self.ale_replications:
+            exp_r = ale_r.explain(include=include)
+            for feature in exp_r.columns:
+                if feature not in explanations:
+                    explanations[feature] = {key: [] for key in include}
+                for key in include:
+                    explanations[feature][key].append(exp_r.loc[key, feature])
+
+        for feature in explanations:
+            for key in explanations[feature]:
+                explanations[feature][key] = np.mean(explanations[feature][key])
+
+        df = pd.DataFrame(explanations)
+        df.set_index(pd.Index(include), inplace=True)
+        return df
+    
+    def explain_local(self, x_explain, method="tree"):
+        """
+        Produce ALE local variable importances for all features for a given observation
+        using bootstrap replications.
+        """
+        explanations = {}
+        for ale_r in self.ale_replications:
+            exp_r = ale_r.explain_local(x_explain, method=method)
+            for feature in exp_r:
+                if feature not in explanations:
+                    explanations[feature] = []
+                explanations[feature].append(exp_r[feature])
+
+        for feature in explanations:
+            explanations[feature] = np.mean(explanations[feature], axis=0)
+
+        return explanations
+    
+    def plot_ale_ice(self, feature, centered=True):
+        """
+        Plot the ALE ICE curves for a given feature using bootstrap replications.
+        """
+        # only plot the first replication for simplicity
+        self.ale_replications[0].plot_ale_ice(feature, centered=centered)
+
+    def plot_connected_paths(self, feature_1, feature_2):
+        """
+        Plot the connected paths for a pair of feature indices (1-based)
+        using bootstrap replications.
+        """
+        # only plot the first replication for simplicity
+        self.ale_replications[0].plot_connected_paths(feature_1, feature_2)
