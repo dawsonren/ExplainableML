@@ -2,63 +2,10 @@ import numpy as np
 from sklearn.manifold import MDS
 import pandas as pd
 
-from utils import generalized_distance
-
-
 def linear_interpolation(x, x0, x1, y0, y1):
     return y0 + np.divide(
         (y1 - y0), (x1 - x0), out=np.zeros_like(y0), where=(x1 - x0) != 0
     ) * (x - x0)
-
-
-def find_path_containing_observation(paths, explain_idx):
-    # find the index of the path containing the observation to explain
-    path_idx = None
-    for l, path in enumerate(paths):
-        for interval in path:
-            if explain_idx in interval:
-                path_idx = l
-                break
-        if path_idx is not None:
-            break
-    return path_idx
-
-
-def map_observation_to_path(paths, n):
-    # map each observation to the index of the path containing it
-    observation_to_path = np.zeros(n, dtype=int)
-    for l, path in enumerate(paths):
-        observation_to_path[np.concatenate(path)] = l
-    return observation_to_path
-
-
-def interpolate_g_values(edges, paths, k_x, x, centered_g_values, categorical):
-    n = len(x)
-    K = calculate_K(edges, categorical)
-    interpolated_centered_g_values = np.zeros(n)
-    l_x = map_observation_to_path(paths, n)
-    interpolated_centered_g_values = linear_interpolation(
-        x,
-        edges[k_x - 1],
-        edges[np.where(k_x == K, k_x - 1, k_x)],
-        centered_g_values[l_x, k_x - 1],
-        # NOTE: for observations in the last bin, use the value at the left edge
-        centered_g_values[l_x, np.where(k_x == K, k_x - 1, k_x)],
-    )
-    return interpolated_centered_g_values
-
-
-def find_nearest_neighbor(x, feature_idx, x_array, categorical, K=1):
-    # find the index of the nearest neighbor in x_array for x
-    idx = feature_idx - 1  # convert to 0-based index
-    # compute generalized distances, ignoring the feature at idx
-    # since it is the feature being explained
-    distances = generalized_distance(
-        x, x_array, categorical, np.std(x_array, axis=0), ignored_variables={idx}
-    )
-    # get the K nearest neighbors
-    nearest_idxs = np.argpartition(distances, K)[:K]
-    return x_array[nearest_idxs], nearest_idxs
 
 
 def calculate_K(edges, categorical=False):
@@ -74,33 +21,31 @@ def calculate_edges(x, K, categorical=False):
         # set to sorted unique values
         edges = np.sort(np.unique(x))
     else:
-        K = min(
-            K, np.unique(x).size - 1
-        )  # ensure bins does not exceed unique values
+        K = min(K, np.unique(x).size - 1)  # ensure bins does not exceed unique values
         # equal-mass bin edges
-        edges = np.quantile(x, np.linspace(0, 1, K), method="closest_observation")
+        edges = np.quantile(x, np.linspace(0, 1, K + 1))
         edges = np.unique(edges)  # remove duplicates
 
     return edges
 
 
 def calculate_bin_index(x, edges, K, categorical=False):
+    """Return 0-based bin index for each element of x."""
     if categorical:
-        return np.searchsorted(edges, x) + 1
+        return np.searchsorted(edges, x)
     else:
-        return np.clip(1, np.searchsorted(edges, x, side="right").astype(int), K)
+        return np.clip(np.searchsorted(edges, x, side="right").astype(int) - 1, 0, K - 1)
 
 
 def calculate_bins(x, edges, categorical=False):
     K = calculate_K(edges, categorical)
-    # calculate bin for each observation
+    # calculate 0-based bin for each observation
     k_x = calculate_bin_index(x, edges, K, categorical)
 
     # calculate observations per bin
     N_k = np.zeros(K)
-    for k in range(1, K + 1):
-        mask = k_x == k
-        N_k[k - 1] = mask.sum()
+    for k in range(K):
+        N_k[k] = (k_x == k).sum()
 
     return k_x, N_k
 
@@ -111,25 +56,15 @@ def calculate_bins_2d(
     K = calculate_K(edges_1, categorical_1)
     M = calculate_K(edges_2, categorical_2)
     n = len(x1)
-    # calculate bin for each observation
-    k_x = np.zeros(n, dtype=int)
-    if categorical_1:
-        k_x = np.searchsorted(edges_1, x1) + 1
-    else:
-        k_x = np.clip(1, np.searchsorted(edges_1, x1, side="right").astype(int), K)
-
-    m_x = np.zeros(n, dtype=int)
-    if categorical_2:
-        m_x = np.searchsorted(edges_2, x2) + 1
-    else:
-        m_x = np.clip(1, np.searchsorted(edges_2, x2, side="right").astype(int), M)
+    # calculate 0-based bin for each observation
+    k_x = calculate_bin_index(x1, edges_1, K, categorical_1)
+    m_x = calculate_bin_index(x2, edges_2, M, categorical_2)
 
     # calculate observations per bin
     N_km = np.zeros((K, M))
-    for k in range(1, K + 1):
-        for m in range(1, M + 1):
-            mask = (k_x == k) & (m_x == m)
-            N_km[k - 1, m - 1] = mask.sum()
+    for k in range(K):
+        for m in range(M):
+            N_km[k, m] = ((k_x == k) & (m_x == m)).sum()
     N_k = N_km.sum(axis=1)
     N_m = N_km.sum(axis=0)
 
@@ -142,13 +77,12 @@ def calculate_deltas(f, X, idx, edges, k_x):
     X_right = X.copy()
     n = X.shape[0]
     for i in range(n):
-        # NOTE: skips observations that are outside the edges
-        # for categorical, since the final category does
-        # not have a right edge.
-        if k_x[i] >= len(edges):
+        # NOTE: skips observations in the final categorical bin since it
+        # has no right edge (categorical bins correspond to unique values).
+        if k_x[i] >= len(edges) - 1:
             continue
-        X_left[i, idx] = edges[k_x[i] - 1]
-        X_right[i, idx] = edges[k_x[i]]
+        X_left[i, idx] = edges[k_x[i]]
+        X_right[i, idx] = edges[k_x[i] + 1]
     deltas = f(X_right) - f(X_left)
     return deltas
 
@@ -164,19 +98,18 @@ def calculate_deltas_2d(f, X, idx_1, idx_2, edges_1, edges_2, k_x, m_x):
     X_right_down = X.copy()
     n = X.shape[0]
     for i in range(n):
-        # NOTE: skips observations that are outside the edges
-        # for categorical, since the final category does
-        # not have a right edge.
-        if k_x[i] >= len(edges_1) or m_x[i] >= len(edges_2):
+        # NOTE: skips observations in the final categorical bin since it
+        # has no right edge.
+        if k_x[i] >= len(edges_1) - 1 or m_x[i] >= len(edges_2) - 1:
             continue
-        X_left_up[i, idx_1] = edges_1[k_x[i] - 1]
-        X_left_up[i, idx_2] = edges_2[m_x[i]]
-        X_right_up[i, idx_1] = edges_1[k_x[i]]
-        X_right_up[i, idx_2] = edges_2[m_x[i]]
-        X_left_down[i, idx_1] = edges_1[k_x[i] - 1]
-        X_left_down[i, idx_2] = edges_2[m_x[i] - 1]
-        X_right_down[i, idx_1] = edges_1[k_x[i]]
-        X_right_down[i, idx_2] = edges_2[m_x[i] - 1]
+        X_left_up[i, idx_1] = edges_1[k_x[i]]
+        X_left_up[i, idx_2] = edges_2[m_x[i] + 1]
+        X_right_up[i, idx_1] = edges_1[k_x[i] + 1]
+        X_right_up[i, idx_2] = edges_2[m_x[i] + 1]
+        X_left_down[i, idx_1] = edges_1[k_x[i]]
+        X_left_down[i, idx_2] = edges_2[m_x[i]]
+        X_right_down[i, idx_1] = edges_1[k_x[i] + 1]
+        X_right_down[i, idx_2] = edges_2[m_x[i]]
     deltas = calculate_2d_finite_difference(
         f(X_right_up), f(X_left_up), f(X_right_down), f(X_left_down)
     )
@@ -218,7 +151,7 @@ def relabel_categorical_features(X, idx, categorical):
         if categorical[j]:
             # TV distance for categorical features
             contingency_table = pd.crosstab(X[:, idx], X[:, j]) / n
-            contingency_table = contingency_table.values / n
+            contingency_table = contingency_table.values
             for i in range(K):
                 for k in range(i + 1, K):
                     dist = tv_distance(contingency_table[i, :], contingency_table[k, :])

@@ -210,3 +210,6 @@ __marimo__/
 
 # everything in figures
 figures/*
+
+# everything in cached_explanations
+cached_explanations/*

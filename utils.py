@@ -2,7 +2,6 @@ import math
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 class Explanation:
@@ -19,7 +18,8 @@ class Explanation:
         - categorical: List of booleans indicating if each feature is categorical.
                        If None, all features are treated as continuous.
         """
-        if not callable(f):
+        # check f is callable or sklearn
+        if not callable(f) and not hasattr(f, "predict"):
             raise ValueError("f must be a callable function.")
         if not isinstance(X, (np.ndarray, pd.DataFrame)):
             raise ValueError("X must be a 2D numpy array or pandas DataFrame.")
@@ -28,8 +28,8 @@ class Explanation:
 
         self.is_dataframe = isinstance(X, pd.DataFrame)
         self.n, self.d = X.shape
-        self.f = self._log_query_points(f)
-        self.query_log = set()
+        self.f = self._log_query_points(f) if callable(f) else f
+        self.query_log = []
 
         if self.is_dataframe:
             # store the DataFrame and its values
@@ -71,7 +71,7 @@ class Explanation:
             # Log the query points
             if log:
                 for i in range(X_values.shape[0]):
-                    self.query_log.add(tuple(X_values[i, :]))
+                    self.query_log.append(X_values[i, :])
             if self.is_dataframe and isinstance(X, np.ndarray):
                 X = pd.DataFrame(X, columns=self.feature_names)
             return f(X)
@@ -79,7 +79,7 @@ class Explanation:
         return wrapper
 
     def get_query_points(self):
-        return np.array(list(self.query_log))
+        return np.array(self.query_log)
 
     def explain(self):
         raise NotImplementedError("Subclasses should implement this method.")
@@ -105,7 +105,7 @@ def bin_selection(n):
     return nice
 
 
-def generalized_distance(x, X, categorical, std_devs, ignored_variables=None):
+def generalized_distance(x, X, categorical, std_devs, ignored_variables=None, multipliers=None):
     """
     Compute generalized distance between a point x and each row in X.
 
@@ -122,13 +122,29 @@ def generalized_distance(x, X, categorical, std_devs, ignored_variables=None):
     # std_devs is only used for continuous features
     n, d = X.shape
     dist = np.zeros(n)
+    multipliers = np.ones(d) if multipliers is None else multipliers
 
     for i in range(d):
         if ignored_variables and i in ignored_variables:
             continue
         if categorical[i]:
-            dist += (X[:, i] != x[i]).astype(int)
+            dist += (X[:, i] != x[i]).astype(int) * multipliers[i]
         else:
-            dist += (X[:, i] - x[i]) ** 2 / (std_devs[i] ** 2)
+            dist += (X[:, i] - x[i]) ** 2 / (std_devs[i] ** 2) * multipliers[i]
 
     return np.sqrt(dist)
+
+def kernel_weighting(distances, bandwidth):
+    """
+    Apply kernel weighting to the distances.
+
+    Parameters:
+        distances: A 1-D numpy array of distances.
+        bandwidth: The bandwidth parameter for the kernel.
+
+    Returns:
+        A 1-D numpy array of kernel weights.
+    """
+    # Apply a Gaussian kernel
+    weights = np.exp(-0.5 * (distances / bandwidth) ** 2)
+    return weights / weights.sum()

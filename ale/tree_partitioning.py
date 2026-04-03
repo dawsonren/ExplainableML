@@ -3,13 +3,12 @@ Provide tree partitioning to create connected paths.
 """
 
 from typing import List, Any, Optional, Dict
-import warnings
 from dataclasses import dataclass, field
 from queue import PriorityQueue
 
 import numpy as np
 
-from ale.shared import calculate_K, calculate_bins
+from ale.shared import calculate_K, calculate_bins, calculate_bin_index
 
 ###
 ### Helper classes
@@ -53,7 +52,9 @@ class ConnectedKDForest:
     for the x_new's interval k.
     """
 
-    def __init__(self, feature_idx: int, edges: np.ndarray, categorical: list, label_to_num: dict):
+    def __init__(
+        self, feature_idx: int, edges: np.ndarray, categorical: list, label_to_num: dict
+    ):
         self.feature_idx = feature_idx
         self.edges = edges
         self.categorical = categorical
@@ -72,20 +73,20 @@ class ConnectedKDForest:
                 if val in self.label_to_num[j]:
                     x_converted[j] = self.label_to_num[j][val]
                 else:
-                    raise ValueError(f"Value {val} not found in label_to_num mapping for feature {j}")
+                    raise ValueError(
+                        f"Value {val} not found in label_to_num mapping for feature {j}"
+                    )
         return x_converted
 
     def _bin_for_xj(self, x_new: np.ndarray) -> int:
         """
         Compute the 0-based interval k for a new point along feature j.
         """
-        xj = np.array([x_new[self.feature_idx]])
-        k_x, _ = calculate_bins(
-            xj, self.edges, categorical=self.categorical[self.feature_idx]
-        )
-        # calculate_bins returns 1..K; convert to 0..K-1
-        return int(k_x[0] - 1)
-    
+        xj = x_new[self.feature_idx]
+        return int(calculate_bin_index(
+            xj, self.edges, self.K, categorical=self.categorical[self.feature_idx]
+        ))
+
     def _collect_leaf_indices(self, node: Optional[KDNode], k: int) -> np.ndarray:
         """
         Collect all training indices for interval k from all leaf nodes
@@ -166,7 +167,11 @@ class ConnectedKDForest:
         }
 
     def route_and_pick_representative(
-        self, x_new: np.ndarray, X: np.ndarray, strategy: str = "first", levels_up: int = 0
+        self,
+        x_new: np.ndarray,
+        X: np.ndarray,
+        strategy: str = "first",
+        levels_up: int = 0,
     ) -> Dict[str, object]:
         """
         Route and select a single representative 'actual x' at the leaf.
@@ -319,9 +324,9 @@ def _split_leaf(
 
     # should be rare: if all variables flat, split on first variable
     if m_star is None:
-        warnings.warn(
-            "generate_connected_delta_values: all features flat, splitting on first variable"
-        )
+        # warnings.warn(
+        #     "generate_connected_delta_values: all features flat, splitting on first variable"
+        # )
         m_star = candidate_features[0]
         best_medians = np.array([np.median(X[R[k], m_star]) for k in range(K)])
 
@@ -360,7 +365,7 @@ def generate_connected_kdforest_and_paths(
     deltas: np.ndarray,
     categorical: list,
     label_to_num: dict,
-    L: int
+    L: int,
 ):
     """
     Parameters:
@@ -380,20 +385,23 @@ def generate_connected_kdforest_and_paths(
     k_x, _ = calculate_bins(xj, edges, categorical=categorical[j])
 
     K = calculate_K(edges, categorical[j])
-    forest = ConnectedKDForest(feature_idx=j, edges=edges, categorical=categorical, label_to_num=label_to_num)
+    forest = ConnectedKDForest(
+        feature_idx=j, edges=edges, categorical=categorical, label_to_num=label_to_num
+    )
     forest.K = K
 
     # Initial leaf set at root: list of K intervals, each a list of indices
     root_R = []
-    for k in range(1, K + 1):
+    for k in range(K):
         mask = k_x == k
         # store as python lists of ints
         root_R.append(np.where(mask)[0].astype(int).tolist())
 
     if any([len(interval) == 0 for interval in root_R]):
-        # get the index of empty intervals
-        empty_intervals = [k + 1 for k in range(K) if len(root_R[k]) == 0]
-        print(f"generate_connected_kdforest_and_paths: empty intervals found at root: {empty_intervals}")
+        empty_intervals = [k for k in range(K) if len(root_R[k]) == 0]
+        print(
+            f"generate_connected_kdforest_and_paths: empty intervals found at root: {empty_intervals}"
+        )
 
     root = KDNode(split_feature=None, thresholds=None, left=None, right=None, R=root_R)
 

@@ -7,11 +7,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from ale.ale_plot import _ale_1d, _ale_2d
-from ale.shared import relabel_categorical_features
+from ale.shared import calculate_edges, calculate_K, relabel_categorical_features
 from ale.ale_vim import (
     _ale_main_vim,
-    _ale_interaction_vim,
-    _diagnostic_statistic,
     _ale_total_vim,
     _ale_local_vim,
 )
@@ -26,11 +24,12 @@ class ALE(Explanation):
         feature_names=None,
         K=None,
         L=None,
-        levels_up=None,
         categorical=None,
         verbose=True,
         interpolate=True,
-        centering="x"
+        centering="x",
+        knn_smooth=None,
+        edges=None,
     ):
         """
         Initialize the ALE object.
@@ -39,15 +38,20 @@ class ALE(Explanation):
         - f: The model function that takes a 2D numpy array and returns predictions.
         - X: The input data as a 2D numpy array or pandas DataFrame.
         - feature_names: List of feature names. If None and X is a DataFrame, use its columns.
-        - bins: Number of bins for ALE calculation.
-        - categorical: List of booleans indicating if each feature is categorical.
-                       If None, all features are treated as continuous.
+        - K: number of bins for the ALE calculation.
+        - L: number of paths to create.
+        - categorical: list of bool of whether or not each feature is categorical.
+        - verbose: whether to print verbose output.
+        - interpolate: whether to interpolate the ALE values.
+        - centering: how to center the ALE values.
+        - knn_smooth: if set, smooth deltas within each bin using KNN averaging.
+        - edges: optional dict mapping 1-indexed feature index to edges array.
+                 Features not in the dict will have edges calculated as usual.
         """
         super().__init__(f, X, feature_names, categorical)
 
         self.K = bin_selection(self.n) if K is None else K
         self.L = self.n // self.K if L is None else L
-        self.levels_up = 0 if levels_up is None else levels_up
 
         if self.K >= self.n / 2:
             print(
@@ -60,6 +64,7 @@ class ALE(Explanation):
         self.verbose = verbose
         self.interpolate = interpolate
         self.centering = centering
+        self.knn_smooth = knn_smooth
         # wrap f to handle categorical feature conversion
         self.original_f = f
         self.f = self._wrap_convert_function(self.f)
@@ -70,6 +75,22 @@ class ALE(Explanation):
         # preprocess categorical features
         self._preprocess_categorical_features()
 
+        # compute edges once per feature from the training data
+        self.edges = {}
+        edges = edges or {}
+        for j in range(self.d):
+            if (j + 1) in edges:
+                self.edges[j] = edges[j + 1]
+            else:
+                self.edges[j] = calculate_edges(
+                    self.X_values[:, j], self.K, self.categorical[j]
+                )
+        # actual K per feature (may differ from requested K after dedup)
+        self.K_per_feature = {
+            j: calculate_K(self.edges[j], self.categorical[j])
+            for j in range(self.d)
+        }
+
         # keep track of connected paths from total connected VIM
         self.connected_paths = {}
         # keep track of connected forest from total connected VIM
@@ -78,10 +99,11 @@ class ALE(Explanation):
         self.g_values = {}
         # keep track of centered g-values from total connected VIM
         self.centered_g_values = {}
-        # keep track of edges, populated by ale_total_vim
-        self.edges = {}
         # keep track of path for each observation for each feature
         self.observation_to_path = {}
+        # keep track of raw deltas and bin assignments for each feature
+        self.deltas = {}
+        self.k_x = {}
 
     def _wrap_convert_function(self, f):
         """
@@ -326,37 +348,11 @@ class ALE(Explanation):
             self.f,
             self.X_values,
             idx + 1,
-            bins=self.K,
+            edges=self.edges[idx],
             categorical=self.categorical[idx],
+            interpolate=self.interpolate and not self.categorical[idx],
+            centering=self.centering,
         )
-
-    def ale_interaction_vim(self, feature):
-        """
-        Calculate the interaction effect variable importance measure (VIM) for a given feature index (1-based).
-
-        Parameters:
-        - feature: 1-based index or feature name.
-
-        Returns:
-        - The interaction effect VIM value.
-        """
-        idx = self._get_feature_index(feature)
-
-        return _ale_interaction_vim(
-            self.f, self.X_values, idx + 1, self.K, categorical=self.categorical
-        )
-
-    def diagnostic_statistic(self):
-        """
-        Return the R^2 statistic for the second-order ALE model.
-
-        Returns:
-        - The R^2 statistic value.
-        """
-        # TODO: this is wrong!
-        # return _diagnostic_statistic(
-        #     self.f, self.X_values, self.K, categorical=self.categorical
-        # )
 
     def ale_total_vim(self, feature, method="connected"):
         """
@@ -373,7 +369,16 @@ class ALE(Explanation):
         if method not in ["connected", "quantile"]:
             raise ValueError("Method must be either 'connected' or 'quantile'.")
 
-        total_vim, forest, paths, g_values, centered_g_values, edges, observation_to_path = _ale_total_vim(
+        (
+            total_vim,
+            forest,
+            paths,
+            g_values,
+            centered_g_values,
+            observation_to_path,
+            deltas,
+            k_x,
+        ) = _ale_total_vim(
             self.f,
             self.X_values,
             idx + 1,
@@ -383,7 +388,9 @@ class ALE(Explanation):
             self.label_to_num,
             method=method,
             interpolate=self.interpolate and not self.categorical[idx],
-            centering=self.centering
+            centering=self.centering,
+            edges=self.edges[idx],
+            knn_smooth=self.knn_smooth,
         )
         # store the generated paths for potential reuse
         if method == "connected":
@@ -391,8 +398,9 @@ class ALE(Explanation):
             self.connected_forest[idx] = forest
             self.g_values[idx] = g_values
             self.centered_g_values[idx] = centered_g_values
-            self.edges[idx] = edges
             self.observation_to_path[idx] = observation_to_path
+            self.deltas[idx] = deltas
+            self.k_x[idx] = k_x
         return total_vim
 
     def explain(self, include=("main", "total_quantile", "total_connected")):
@@ -401,7 +409,7 @@ class ALE(Explanation):
 
         Parameters:
         - include: A tuple specifying which explanations to include.
-                   Options are 'main', 'total_quantile', 'total_connected', and 'interaction'.
+                   Options are 'main', 'total_quantile', 'total_connected'.
                    Default is ('main', 'total_quantile', 'total_connected').
 
         Returns:
@@ -409,10 +417,10 @@ class ALE(Explanation):
         """
         if not (
             set(include)
-            <= set(("main", "total_quantile", "total_connected", "interaction"))
+            <= set(("main", "total_quantile", "total_connected"))
         ):
             raise ValueError(
-                'Included explanations must belong to the set ("main", "total_quantile", "total_connected", "interaction").'
+                'Included explanations must belong to the set ("main", "total_quantile", "total_connected").'
             )
 
         explanations = {}
@@ -433,8 +441,6 @@ class ALE(Explanation):
                 explanation_i["total_connected"] = np.sqrt(
                     self.ale_total_vim(i + 1, method="connected")
                 )
-            if "interaction" in include:
-                explanation_i["interaction"] = np.sqrt(self.ale_interaction_vim(i + 1))
 
             explanations[self.feature_names[i]] = explanation_i
 
@@ -442,45 +448,58 @@ class ALE(Explanation):
         df.set_index(pd.Index(include), inplace=True)
         return df
 
-    def explain_local(self, x_explain, method="tree"):
-        """
-        Produce ALE local variable importances for all features for a given observation.
-        """
-        # check dimension of x_explain
-        if x_explain.ndim != 1 or x_explain.shape[0] != self.d:
-            raise ValueError(f"x_explain must be a 1-D array of length {self.d}.")
-        # check method
-        if method not in ["tree", "nn"]:
-            raise ValueError("method must be either 'tree' or 'nn'.")
-        # convert x_explain to numpy array if it's a pandas Series
-        if isinstance(x_explain, pd.Series):
-            x_explain = x_explain.values
+    def _prepare_explain(self, X_explain):
+        """Convert and validate X_explain for local explanation methods."""
+        if isinstance(X_explain, pd.Series):
+            X_explain = X_explain.values
+        if X_explain.ndim == 1:
+            X_explain = X_explain[np.newaxis, :]
+        for j in range(self.d):
+            if j not in self.connected_paths or j not in self.connected_forest:
+                raise ValueError(
+                    f"Connected paths/forest for feature index {j + 1} not found. "
+                    "Please run ale_total_vim with method='connected' first."
+                )
+        return X_explain
 
-        explanations = {}
-        for i in range(self.d):
+    def explain_local(self, X_explain, levels_up=0):
+        """
+        Produce ALE local explanations by routing each point through the
+        connected KD-forest and looking up its path's centered g-value.
+
+        Parameters:
+        - X_explain: Points to explain (n_explain, d) or (d,).
+        - levels_up: Number of levels to go up in the tree for smoothing.
+                     0 = exact leaf, higher = average over more paths.
+        """
+        X_explain = self._prepare_explain(X_explain)
+
+        explanations = np.zeros((X_explain.shape[0], self.d))
+        for j in range(self.d):
             if self.verbose:
                 print(
-                    f"Generating local explanation for feature {i + 1} ({self.feature_names[i]})"
+                    f"Generating local explanation for feature {j + 1} ({self.feature_names[j]})"
                 )
-            if i not in self.connected_paths or i not in self.connected_forest:
-                raise ValueError(
-                    f"Connected paths/forest for feature index {i + 1} not found. Please run ale_total_vim with method='connected' first."
-                )
-            local_vim = _ale_local_vim(
+            explanations[:, j] = _ale_local_vim(
                 self.X_values,
-                i + 1,
-                x_explain,
-                self.centered_g_values[i],
-                self.K,
+                j + 1,
+                X_explain,
+                self.centered_g_values[j],
                 self.categorical,
-                self.observation_to_path[i],
-                forest=self.connected_forest[i],
-                method=method,
-                interpolate=self.interpolate and not self.categorical[i],
+                self.observation_to_path[j],
+                forest=self.connected_forest[j],
+                levels_up=levels_up,
+                edges=self.edges[j],
             )
-            explanations[self.feature_names[i]] = local_vim
 
         return explanations
+
+    def explain_global(self, levels_up=0):
+        """
+        The global effect is the sample variance of the local effects across all X values.
+        """
+        local_explanations = self.explain_local(self.X_values, levels_up=levels_up)
+        return np.var(local_explanations, axis=0)
 
     def plot_connected_paths(self, feature_1, feature_2):
         """
@@ -493,7 +512,9 @@ class ALE(Explanation):
         idx_1 = self._get_feature_index(feature_1)
         idx_2 = self._get_feature_index(feature_2)
         if idx_1 == idx_2:
-            raise ValueError("Feature indices must be different for connected paths plot.")
+            raise ValueError(
+                "Feature indices must be different for connected paths plot."
+            )
 
         if idx_1 not in self.connected_paths or idx_2 not in self.connected_paths:
             raise ValueError(
@@ -506,6 +527,13 @@ class ALE(Explanation):
                 f"No connected path found between features {idx_1 + 1} and {idx_2 + 1}."
             )
 
+        categorical_1 = self.categorical[idx_1]
+        edges_1 = self.edges[idx_1]
+
+        if not categorical_1:
+            for e in edges_1:
+                plt.axvline(x=e, color="black", linestyle="--", alpha=0.4)
+
         X = self.X_values
         # show the connected paths
         plt.scatter(X[:, idx_1], X[:, idx_2], alpha=0.3)
@@ -516,11 +544,9 @@ class ALE(Explanation):
 
         plt.xlabel(f"{self.feature_names[idx_1]}")
         plt.ylabel(f"{self.feature_names[idx_2]}")
-        plt.title(
-            f"Connected Paths for {self.feature_names[idx_1]}"
-        )
+        plt.title(f"Connected Paths for {self.feature_names[idx_1]}")
 
-    def plot_ale_ice(self, feature, centered=True):
+    def plot_ale_ice(self, feature):
         idx = self._get_feature_index(feature)
         categorical = self.categorical[idx]
 
@@ -531,30 +557,153 @@ class ALE(Explanation):
             )
 
         # get centered g_values
-        y_axis = self.centered_g_values[idx] if centered else self.g_values[idx]
+        y_axis = self.centered_g_values[idx].centered_g_values
         edges = self.edges[idx]
         # plot versus feature edges
-        for l in range(len(y_axis)):
+        for l in range(y_axis.shape[1]):
             # if categorical, plot as bar chart
             if categorical:
                 # map back to original category labels
                 original_edges = [self.num_to_label[idx][int(e)] for e in edges]
-                plt.bar(original_edges, y_axis[l, :], width=0.5, align="center", alpha=0.7)
+                plt.bar(
+                    original_edges, y_axis[:, l], width=0.5, align="center", alpha=0.7
+                )
                 # draw horizontal line at y=0
                 plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
             else:
-                # plot 
-                plt.plot(edges, y_axis[l, :], color="blue", alpha=0.8)
+                # plot
+                plt.plot(edges, y_axis[:, l], color="blue", alpha=0.8)
         plt.xlabel(f"{self.feature_names[idx]}")
         plt.ylabel("Centered g-values")
-        plt.title(
-            f"Centered g-values for {self.feature_names[idx]}"
-        )
+        plt.title(f"Centered g-values for {self.feature_names[idx]}")
         # plot horizontal lines at edges
         if not categorical:
             for e in edges:
                 plt.axvline(x=e, color="black", linestyle="--", alpha=0.4)
-    
+
+    def plot_paths_summary(self, feature_1, feature_2, figsize=(21, 5), cmap="tab10"):
+        """
+        Combined three-subplot visualization linking data partitions to g-value curves.
+
+        Left subplot — scatter of (feature_1, feature_2) with each path's observations
+        colored uniquely. Bin centroid trajectories are drawn as thin lines.
+
+        Middle subplot — heatmap of f evaluated across the grid of feature_1 and feature_2,
+        with the same path centroids overlaid.
+
+        Right subplot — centered g-value curve for each path vs feature_1 edges,
+        using the same per-path colors as the left subplot.
+
+        Parameters
+        ----------
+        feature_1 : int or str
+            Feature whose ALE paths / g-value curves are shown (x-axis in all subplots).
+        feature_2 : int or str
+            Feature shown on the y-axis of the left scatter subplot.
+        figsize : tuple, default (21, 5)
+        cmap : str, default "tab10"
+            Matplotlib colormap name. Should have at least L distinct colors.
+
+        Returns
+        -------
+        fig, (ax_data, ax_heatmap, ax_effect)
+        """
+        idx_1 = self._get_feature_index(feature_1)
+        idx_2 = self._get_feature_index(feature_2)
+
+        if idx_1 == idx_2:
+            raise ValueError("feature_1 and feature_2 must be different.")
+        if idx_1 not in self.connected_paths:
+            raise ValueError(
+                f"Connected paths for feature {idx_1 + 1} not found. "
+                "Run ale_total_vim(method='connected') first."
+            )
+
+        paths = self.connected_paths[idx_1]
+        edges = self.edges[idx_1]
+        g_vals = self.centered_g_values[idx_1].centered_g_values  # (K+1, L) or (K, L)
+        L = g_vals.shape[1]
+
+        cmap_obj = plt.get_cmap(cmap)
+        colors = [cmap_obj(l / max(L - 1, 1)) for l in range(L)]
+
+        fig, (ax_data, ax_heatmap, ax_effect) = plt.subplots(1, 3, figsize=figsize)
+
+        # --- Left: scatter + path intervals ---
+        ax_data.scatter(
+            self.X_values[:, idx_1], self.X_values[:, idx_2],
+            color="lightgray", alpha=0.3, s=5, zorder=1,
+        )
+        for l, path in enumerate(paths):
+            c = colors[l]
+            centroids_x, centroids_y = [], []
+            for k, interval in enumerate(path):
+                if len(interval) > 0:
+                    pts = self.X_values[interval]
+                    # double check that all points are within the bin edges
+                    assert np.all(pts[:, idx_1] >= edges[k]) and np.all(pts[:, idx_1] <= edges[k + 1]), "Points are not within bin edges"
+                    ax_data.scatter(
+                        pts[:, idx_1], pts[:, idx_2],
+                        color=c, alpha=0.6, s=10, zorder=2,
+                    )
+                    centroids_x.append(pts[:, idx_1].mean())
+                    centroids_y.append(pts[:, idx_2].mean())
+            if centroids_x:
+                ax_data.plot(centroids_x, centroids_y, color=c, alpha=0.5, linewidth=1)
+                ax_heatmap.plot(centroids_x, centroids_y, color=c, alpha=0.8, linewidth=2, marker='o', markersize=3)
+        for e in edges:
+            ax_data.axvline(e, color="black", linestyle="--", alpha=0.3)
+        ax_data.set_xlabel(self.feature_names[idx_1])
+        ax_data.set_ylabel(self.feature_names[idx_2])
+        ax_data.set_title(
+            f"Paths: {self.feature_names[idx_1]} vs {self.feature_names[idx_2]}"
+        )
+
+        # --- Middle: Heatmap of f ---
+        grid_size = 50
+        x1_min, x1_max = self.X_values[:, idx_1].min(), self.X_values[:, idx_1].max()
+        x2_min, x2_max = self.X_values[:, idx_2].min(), self.X_values[:, idx_2].max()
+        x1_grid = np.linspace(x1_min, x1_max, grid_size)
+        x2_grid = np.linspace(x2_min, x2_max, grid_size)
+        xx1, xx2 = np.meshgrid(x1_grid, x2_grid)
+
+        X_grid = np.zeros((grid_size * grid_size, self.d))
+        for j in range(self.d):
+            if self.categorical[j]:
+                vals, counts = np.unique(self.X_values[:, j], return_counts=True)
+                X_grid[:, j] = vals[np.argmax(counts)]
+            else:
+                X_grid[:, j] = self.X_values[:, j].mean()
+        
+        X_grid[:, idx_1] = xx1.ravel()
+        X_grid[:, idx_2] = xx2.ravel()
+        
+        z = self.f(X_grid).reshape(grid_size, grid_size)
+        
+        mesh = ax_heatmap.pcolormesh(xx1, xx2, z, shading="auto", cmap="viridis", alpha=0.5)
+        fig.colorbar(mesh, ax=ax_heatmap, label="f(x)")
+        
+        for e in edges:
+            ax_heatmap.axvline(e, color="black", linestyle="--", alpha=0.3)
+        
+        ax_heatmap.set_xlabel(self.feature_names[idx_1])
+        ax_heatmap.set_ylabel(self.feature_names[idx_2])
+        ax_heatmap.set_title(f"Heatmap of {self.f.__name__ if hasattr(self.f, '__name__') else 'model'}")
+
+        # --- Right: g-value curves ---
+        for l in range(L):
+            ax_effect.plot(edges, g_vals[:, l], color=colors[l], label=f"Path {l}")
+        for e in edges:
+            ax_effect.axvline(e, color="black", linestyle="--", alpha=0.3)
+        ax_effect.axhline(0, color="black", alpha=0.2)
+        ax_effect.set_xlabel(self.feature_names[idx_1])
+        ax_effect.set_ylabel("Centered g-value")
+        ax_effect.set_title(f"G-value curves for {self.feature_names[idx_1]}")
+        ax_effect.legend(loc="best", fontsize="small")
+
+        fig.tight_layout()
+        return fig, (ax_data, ax_heatmap, ax_effect)
+
 
 # Bootstrap ALE is just like ALE but subsamples the data with replacement
 # to create multiple explanations. We hope that this reduces variance in the
@@ -568,12 +717,12 @@ class BootstrapALE(Explanation):
         feature_names=None,
         K=None,
         L=None,
-        levels_up=None,
         categorical=None,
         verbose=True,
         interpolate=True,
         centering="x",
-        seed=None
+        knn_smooth=None,
+        seed=None,
     ):
         """
         Initialize the BootstrapALE object.
@@ -583,7 +732,8 @@ class BootstrapALE(Explanation):
         - X: The input data as a 2D numpy array or pandas DataFrame.
         - replications: Number of bootstrap replications.
         - feature_names: List of feature names. If None and X is a DataFrame, use its columns.
-        - bins: Number of bins for ALE calculation.
+        - K: Number of bins for ALE calculation.
+        - L: Number of paths to create.
         - categorical: List of booleans indicating if each feature is categorical.
                        If None, all features are treated as continuous.
         """
@@ -592,7 +742,6 @@ class BootstrapALE(Explanation):
         self.replications = replications
         self.K = bin_selection(self.n) if K is None else K
         self.L = self.n // self.K if L is None else L
-        self.levels_up = 0 if levels_up is None else levels_up
 
         if self.K >= self.n / 2:
             print(
@@ -605,6 +754,7 @@ class BootstrapALE(Explanation):
         self.verbose = verbose
         self.interpolate = interpolate
         self.centering = centering
+        self.knn_smooth = knn_smooth
         self.seed = 42 if seed is None else seed
 
         # create ALE objects for each replication
@@ -621,11 +771,11 @@ class BootstrapALE(Explanation):
                     feature_names=self.feature_names,
                     K=self.K,
                     L=self.L,
-                    levels_up=self.levels_up,
                     categorical=self.categorical,
                     verbose=self.verbose,
                     interpolate=self.interpolate,
-                    centering=self.centering
+                    centering=self.centering,
+                    knn_smooth=self.knn_smooth,
                 )
                 self.ale_replications.append(ale_r)
         else:
@@ -636,11 +786,11 @@ class BootstrapALE(Explanation):
                     feature_names=self.feature_names,
                     K=self.K,
                     L=self.L,
-                    levels_up=self.levels_up,
                     categorical=self.categorical,
                     verbose=self.verbose,
                     interpolate=self.interpolate,
-                    centering=self.centering
+                    centering=self.centering,
+                    knn_smooth=self.knn_smooth,
                 )
             ]
 
@@ -650,7 +800,7 @@ class BootstrapALE(Explanation):
 
         Parameters:
         - include: A tuple specifying which explanations to include.
-                   Options are 'main', 'total_quantile', 'total_connected', and 'interaction'.
+                   Options are 'main', 'total_quantile', 'total_connected'.
                    Default is ('main', 'total_quantile', 'total_connected').
 
         Returns:
@@ -672,36 +822,16 @@ class BootstrapALE(Explanation):
         df = pd.DataFrame(explanations)
         df.set_index(pd.Index(include), inplace=True)
         return df
-    
-    def explain_local(self, x_explain, method="tree"):
+
+    def explain_local(self, X_explain, levels_up=0):
         """
-        Produce ALE local variable importances for all features for a given observation
-        using bootstrap replications.
+        Produce ALE local explanations using bootstrap replications.
+        Averages local explanations across replications.
         """
-        explanations = {}
+        all_explanations = []
         for ale_r in self.ale_replications:
-            exp_r = ale_r.explain_local(x_explain, method=method)
-            for feature in exp_r:
-                if feature not in explanations:
-                    explanations[feature] = []
-                explanations[feature].append(exp_r[feature])
+            exp_r = ale_r.explain_local(X_explain, levels_up=levels_up)
+            all_explanations.append(exp_r)
 
-        for feature in explanations:
-            explanations[feature] = np.mean(explanations[feature], axis=0)
+        return np.mean(all_explanations, axis=0)
 
-        return explanations
-    
-    def plot_ale_ice(self, feature, centered=True):
-        """
-        Plot the ALE ICE curves for a given feature using bootstrap replications.
-        """
-        # only plot the first replication for simplicity
-        self.ale_replications[0].plot_ale_ice(feature, centered=centered)
-
-    def plot_connected_paths(self, feature_1, feature_2):
-        """
-        Plot the connected paths for a pair of feature indices (1-based)
-        using bootstrap replications.
-        """
-        # only plot the first replication for simplicity
-        self.ale_replications[0].plot_connected_paths(feature_1, feature_2)
