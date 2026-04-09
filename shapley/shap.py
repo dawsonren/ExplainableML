@@ -3,6 +3,8 @@ Calculate Shapley values for explanation.
 """
 
 import warnings
+from math import factorial
+
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -100,21 +102,29 @@ class SHAP(Explanation):
         self,
         x_explain,
     ):
-        # this only works for 2 variables but is exact!
-        explanation = np.zeros((x_explain.shape[0], 2))
-        for i in range(x_explain.shape[0]):
-            f_ss = self.f(x_explain[i, :].reshape(1, -1))
-            bs = self.X_values.copy()
-            bs[:, 1] = x_explain[i, 1]
-            sb = self.X_values.copy()
-            sb[:, 0] = x_explain[i, 0]
-            bb = self.X_values.copy()
-            f_bs = self.f(bs)
-            f_sb = self.f(sb)
-            f_bb = self.f(bb)
+        """Exact Shapley via coalition enumeration. O(2^d * n_background) per point.
+        Equivalent to the closed-form d=2 formula. Practical up to d ~ 10."""
+        n_explain, d = x_explain.shape
+        explanation = np.zeros((n_explain, d))
+        denom = factorial(d)
 
-            explanation[i, 0] = 0.5 * (f_ss - f_bs).mean() + 0.5 * (f_sb - f_bb).mean()
-            explanation[i, 1] = 0.5 * (f_ss - f_sb).mean() + 0.5 * (f_bs - f_bb).mean()
+        for i in range(n_explain):
+            x = x_explain[i]
+            v = np.empty(1 << d)
+            for mask in range(1 << d):
+                Z = self.X_values.copy()
+                for j in range(d):
+                    if mask & (1 << j):
+                        Z[:, j] = x[j]
+                v[mask] = self.f(Z).mean()
+            for feat in range(d):
+                phi = 0.0
+                for mask in range(1 << d):
+                    if not (mask & (1 << feat)):
+                        s = bin(mask).count('1')
+                        w = factorial(s) * factorial(d - s - 1) / denom
+                        phi += w * (v[mask | (1 << feat)] - v[mask])
+                explanation[i, feat] = phi
 
         return explanation
 

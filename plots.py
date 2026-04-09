@@ -5,13 +5,15 @@ from experiments import Experiment
 from matplotlib.patches import Patch
 
 def get_full_bounding_box(Xs):
-    x1_mins = [X[:, 0].min() for X in Xs]
-    x1_maxs = [X[:, 0].max() for X in Xs]
-    x2_mins = [X[:, 1].min() for X in Xs]
-    x2_maxs = [X[:, 1].max() for X in Xs]
-    return min(x1_mins), max(x1_maxs), min(x2_mins), max(x2_maxs)
+    """Returns a list of (min, max) tuples, one per feature dimension."""
+    d = Xs[0].shape[1]
+    return [
+        (min(X[:, j].min() for X in Xs), max(X[:, j].max() for X in Xs))
+        for j in range(d)
+    ]
 
 def create_grid(X, resolution=50):
+    assert X.shape[1] == 2, f"create_grid only supports d=2, got d={X.shape[1]}"
     # create 2D grid
     x1_lin = np.linspace(X[:, 0].min(), X[:, 0].max(), resolution)
     x2_lin = np.linspace(X[:, 1].min(), X[:, 1].max(), resolution)
@@ -60,7 +62,8 @@ def plot_replication(experiment: Experiment, rng=None):
     plt.show()
 
 def plot_variability(data_and_fitted_models, bounding_box):
-    x1_low, x1_hi, x2_low, x2_hi = bounding_box
+    x1_low, x1_hi = bounding_box[0]
+    x2_low, x2_hi = bounding_box[1]
     x1_lin = np.linspace(x1_low, x1_hi, 50)
     x2_lin = np.linspace(x2_low, x2_hi, 50)
     xx, yy = np.meshgrid(x1_lin, x2_lin)

@@ -6,7 +6,7 @@ import joblib
 
 import numpy as np
 
-from ale import ALE
+from ale import ALE, BootstrapALE
 
 SAVE_DIR = "cached_explanations"
 
@@ -18,10 +18,13 @@ class DGP:
     sample_X: callable  # (n: int, rng: np.random.Generator) -> np.ndarray
     signal: callable    # (X: np.ndarray) -> np.ndarray
     sigma_eps: float = field(init=False)
+    d: int = field(init=False)
 
     def __post_init__(self):
-        var_fX = float(np.var(self.signal(self.sample_X(n=10000, rng=np.random.default_rng()))))
+        X_probe = self.sample_X(n=10000, rng=np.random.default_rng())
+        var_fX = float(np.var(self.signal(X_probe)))
         self.sigma_eps = float(np.sqrt(var_fX / self.snr))
+        self.d = X_probe.shape[1]
 
     @property
     def slug(self) -> str:
@@ -83,8 +86,8 @@ class Experiment:
 class ExplainerConfig:
     """
     All hyperparameters that control how ALE explanations are produced.
-    Changing any field produces a different explanation, so all fields
-    participate in the cache key.
+    Changing any field (except tag) produces a different explanation, so all
+    fields except tag participate in the cache key.
     """
     K: int = 10
     L: int = 10
@@ -93,6 +96,21 @@ class ExplainerConfig:
     knn_smooth: Optional[int] = None
     levels_up: int = 0
     edges: Optional[dict] = None  # dict mapping 1-based feature index -> edges array
+    variant: str = "standard"     # "standard" or "bootstrap"
+    n_bootstrap: int = 50         # bootstrap replications (variant="bootstrap" only)
+    tag: Optional[str] = None     # human-readable filename label; auto-generated if None
+
+    @property
+    def auto_tag(self) -> str:
+        base = f"K{self.K}_L{self.L}_{self.centering}"
+        if self.levels_up != 0:
+            base += f"_lu{self.levels_up}"
+        if self.variant == "bootstrap":
+            base = f"bale_{base}_nb{self.n_bootstrap}"
+        return base
+
+    def get_tag(self) -> str:
+        return self.tag if self.tag is not None else self.auto_tag
 
 
 @dataclass
@@ -125,6 +143,8 @@ class RunConfig:
             "knn_smooth": ec.knn_smooth,
             "levels_up": ec.levels_up,
             "edges": str(ec.edges),
+            "variant": ec.variant,
+            "n_bootstrap": ec.n_bootstrap,
             "seed": self.seed,
         }
         if grid is not None:
@@ -137,7 +157,7 @@ class RunConfig:
         name = (
             f"ale_{self.experiment.dgp_slug}_{self.experiment.fit_model_slug}"
             f"_n{self.experiment.n}_R{self.experiment.replications}"
-            f"_K{ec.K}_L{ec.L}_{ec.centering}"
+            f"_{ec.get_tag()}"
             f"_{self.cache_key(grid)}.npz"
         )
         return os.path.join(cache_dir, name)
@@ -180,21 +200,36 @@ class RunConfig:
         import time
         from tqdm import tqdm
 
-        for r, (X, y, model) in enumerate(tqdm(runs, desc="ALE replications")):
+        for r, (X, y, model) in enumerate(tqdm(runs, desc="ALE replications", position=1, leave=False)):
             f = model.predict
 
             t0 = time.perf_counter()
-            ale = ALE(
-                f, X,
-                K=ec.K,
-                L=ec.L,
-                centering=ec.centering,
-                interpolate=ec.interpolate,
-                knn_smooth=ec.knn_smooth,
-                edges=ec.edges,
-                verbose=False,
-            )
-            ale.explain(include=("total_connected",))
+            if ec.variant == "bootstrap":
+                ale = BootstrapALE(
+                    f, X,
+                    replications=ec.n_bootstrap,
+                    K=ec.K,
+                    L=ec.L,
+                    centering=ec.centering,
+                    interpolate=ec.interpolate,
+                    knn_smooth=ec.knn_smooth,
+                    verbose=False,
+                )
+                ale.explain(include=("total_connected",))
+                last_edges = ale.ale_replications[0].edges
+            else:
+                ale = ALE(
+                    f, X,
+                    K=ec.K,
+                    L=ec.L,
+                    centering=ec.centering,
+                    interpolate=ec.interpolate,
+                    knn_smooth=ec.knn_smooth,
+                    edges=ec.edges,
+                    verbose=False,
+                )
+                ale.explain(include=("total_connected",))
+                last_edges = ale.edges
             tree_time = time.perf_counter() - t0
 
             t0 = time.perf_counter()
@@ -202,9 +237,8 @@ class RunConfig:
             explain_time = time.perf_counter() - t0
 
             ale_exps.append(exps)
-            ale_times.append(explain_time / (grid.shape[0] + X.shape[0]))
+            ale_times.append((tree_time + explain_time) / grid.shape[0])
             ale_tree_times.append(tree_time)
-            last_edges = ale.edges
 
         ale_exps = np.array(ale_exps)
 
@@ -216,6 +250,15 @@ class RunConfig:
             "ale_tree_times": np.array(ale_tree_times),
             "grid": grid,
         }
-        # Save edges as object array so np.savez can handle the dict
-        np.savez(path, **results, edges=np.array([last_edges], dtype=object))
+        np.savez(
+            path, **results,
+            edges=np.array([last_edges], dtype=object),
+            meta_K=np.array(ec.K),
+            meta_L=np.array(ec.L),
+            meta_centering=np.array(ec.centering),
+            meta_levels_up=np.array(ec.levels_up),
+            meta_variant=np.array(ec.variant),
+            meta_n_bootstrap=np.array(ec.n_bootstrap),
+            meta_tag=np.array(ec.get_tag()),
+        )
         return results

@@ -48,7 +48,7 @@ class ALE(Explanation):
         - edges: optional dict mapping 1-indexed feature index to edges array.
                  Features not in the dict will have edges calculated as usual.
         """
-        super().__init__(f, X, feature_names, categorical)
+        super().__init__(f, X, feature_names, categorical, log_queries=False)
 
         self.K = bin_selection(self.n) if K is None else K
         self.L = self.n // self.K if L is None else L
@@ -737,7 +737,7 @@ class BootstrapALE(Explanation):
         - categorical: List of booleans indicating if each feature is categorical.
                        If None, all features are treated as continuous.
         """
-        super().__init__(f, X, feature_names, categorical)
+        super().__init__(f, X, feature_names, categorical, log_queries=False)
 
         self.replications = replications
         self.K = bin_selection(self.n) if K is None else K

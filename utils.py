@@ -5,7 +5,7 @@ import pandas as pd
 
 
 class Explanation:
-    def __init__(self, f, X, feature_names=None, categorical=None):
+    def __init__(self, f, X, feature_names=None, categorical=None, log_queries=False):
         """
         Initialize an Explanation. This automatically handles
         numpy arrays and pandas DataFrames, and populates
@@ -28,8 +28,8 @@ class Explanation:
 
         self.is_dataframe = isinstance(X, pd.DataFrame)
         self.n, self.d = X.shape
-        self.f = self._log_query_points(f) if callable(f) else f
         self.query_log = []
+        self.f = self._log_query_points(f) if (callable(f) and log_queries) else f
 
         if self.is_dataframe:
             # store the DataFrame and its values

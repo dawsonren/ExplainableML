@@ -3,6 +3,7 @@ Model factory functions and DGP sampling strategies for experiments.
 Import these into notebooks instead of defining them inline.
 """
 
+import hashlib
 import json
 import os
 
@@ -17,29 +18,30 @@ from sklearn.model_selection import RandomizedSearchCV
 # DGP sampling strategies
 # ---------------------------------------------------------------------------
 
-def sample_X_uniform(rho, scale):
+def sample_X_uniform(rho, scale, d=2):
     """
-    Sample 2D features with controlled correlation via a shared uniform latent.
+    Sample d-dimensional features with controlled pairwise correlation via a shared uniform latent.
 
-    rho controls correlation: Cov(X1, X2) / Var(X1) ≈ rho
+    rho controls correlation: Cor(Xi, Xj) ≈ rho for all i≠j
     scale controls feature spread: features are approximately in [-scale, scale]
     """
     def sample(n, rng: np.random.Generator):
         sigma_x = scale * np.sqrt((1 - rho) / (3 * rho))
         x = rng.uniform(-scale, scale, size=n)
-        x1 = x + rng.normal(size=n, scale=sigma_x)
-        x2 = x + rng.normal(size=n, scale=sigma_x)
-        return np.column_stack([x1, x2])
-    sample.__name__ = f"sample_X_uniform_rho{rho:g}_scale{scale:g}"
+        cols = [x + rng.normal(size=n, scale=sigma_x) for _ in range(d)]
+        return np.column_stack(cols)
+    sample.__name__ = f"sample_X_uniform_d{d}_rho{rho:g}_scale{scale:g}"
     return sample
 
 
-def sample_X_gaussian(rho, scale):
-    """Sample 2D features from a bivariate Gaussian with correlation rho."""
+def sample_X_gaussian(cov):
+    """Sample d-dimensional features from a multivariate Gaussian with the given covariance matrix."""
+    cov = np.array(cov, dtype=float)
+    d = cov.shape[0]
+    cov_hash = hashlib.md5(np.ascontiguousarray(cov).tobytes()).hexdigest()[:8]
     def sample(n, rng: np.random.Generator):
-        cov = [[scale**2, rho * scale**2], [rho * scale**2, scale**2]]
-        return rng.multivariate_normal(mean=[0, 0], cov=cov, size=n)
-    sample.__name__ = f"sample_X_gaussian_rho{rho:g}_scale{scale:g}"
+        return rng.multivariate_normal(mean=np.zeros(d), cov=cov, size=n)
+    sample.__name__ = f"sample_X_gaussian_d{d}_{cov_hash}"
     return sample
 
 
@@ -69,15 +71,47 @@ def signal_tricky_valley_rho_9(X):
         0, np.abs(X[:, 0] - X[:, 1]) - 0.45
     ) ** (1 / 3)
 
+def signal_threshold(X):
+    return np.sign(X[:, 0]) + X[:, 1] ** 2
+
+def signal_multiplicative(X):
+    return X[:, 0] + X[:, 1] + 4 * X[:, 0] * X[:, 1]
+
+def signal_cubic(X):
+    """x1^3 + x2^2 — high curvature; stresses ALE finite-difference approximation."""
+    return X[:, 0] ** 3 + X[:, 1] ** 2
+
+def signal_abs(X):
+    """abs(x1) + x2^2 — non-differentiable kink at x1=0."""
+    return np.abs(X[:, 0]) + X[:, 1] ** 2
+
+
 # ---------------------------------------------------------------------------
 # True explanations (only for additive signals)
 # ---------------------------------------------------------------------------
 
 def signal_basic_explanation(X):
-    return np.vstack([X[:, 0], X[:, 1] ** 2]).T
+    return np.vstack([X[:, 0], X[:, 1] ** 2 - 1]).T
 
 def signal_nonlinear_explanation(X):
     return np.vstack([X[:, 0], np.sin(4 * X[:, 1])]).T
+
+def signal_threshold_explanation(X):
+    return np.column_stack([np.sign(X[:, 0]), X[:, 1] ** 2 - 1])
+
+def signal_cubic_explanation(X):
+    """Shapley under N(0,1): E[X^3]=0 (odd moment), E[X^2]=1."""
+    return np.column_stack([X[:, 0] ** 3, X[:, 1] ** 2 - 1])
+
+def signal_abs_explanation(X):
+    """Shapley under N(0,1): E[|X|]=sqrt(2/pi)."""
+    return np.column_stack([np.abs(X[:, 0]) - np.sqrt(2 / np.pi), X[:, 1] ** 2 - 1])
+
+def signal_multiplicative_explanation(X, rho):
+    """Shapley-value explanation for signal_multiplicative under Gaussian(0, [[1,rho],[rho,1]])."""
+    phi1 = X[:, 0] + 2 * X[:, 0] * X[:, 1] - 2 * rho
+    phi2 = X[:, 1] + 2 * X[:, 0] * X[:, 1] - 2 * rho
+    return np.column_stack([phi1, phi2])
 
 # ---------------------------------------------------------------------------
 # Model factory functions
@@ -143,10 +177,10 @@ class NNModelTuner:
     experiment = Experiment(..., fit_model=nn_model, fit_model_slug=nn_model.__name__)
     """
     _param_dist = {
-        "hidden_layer_sizes": [(50,), (100,), (200,), (50, 50), (100, 50), (100, 100)],
+        "hidden_layer_sizes": [(2,), (3,), (5,), (10,), (20,), (50,), (100,)],
         "activation": ["tanh", "relu"],
         "alpha": [1e-5, 1e-4, 1e-3, 1e-2],
-        "solver": ["lbfgs", "adam"],
+        "solver": ["lbfgs"],
     }
 
     def __init__(self, cv=5, n_iter=20, verbose=False, snr=None):
@@ -192,7 +226,12 @@ class NNModelTuner:
             if cache_path is not None:
                 os.makedirs(cache_dir, exist_ok=True)
                 with open(cache_path, "w") as f:
-                    json.dump({**p, "hidden_layer_sizes": list(p["hidden_layer_sizes"])}, f, indent=2)
+                    json.dump({
+                        **p,
+                        "hidden_layer_sizes": list(p["hidden_layer_sizes"]),
+                        "cv_r2": search.best_score_,
+                        "max_r2": 1 - 1 / (1 + self.snr) if self.snr is not None else None,
+                    }, f, indent=2)
 
         return make_nn_model(
             hidden_layer_sizes=p["hidden_layer_sizes"],
@@ -264,7 +303,11 @@ class RFModelTuner:
             if cache_path is not None:
                 os.makedirs(cache_dir, exist_ok=True)
                 with open(cache_path, "w") as f:
-                    json.dump(p, f, indent=2)
+                    json.dump({
+                        **p,
+                        "cv_r2": search.best_score_,
+                        "max_r2": 1 - 1 / (1 + self.snr) if self.snr is not None else None,
+                    }, f, indent=2)
 
         return make_rf_model(
             n_estimators=p["n_estimators"],
