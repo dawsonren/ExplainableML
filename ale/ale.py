@@ -462,7 +462,7 @@ class ALE(Explanation):
                 )
         return X_explain
 
-    def explain_local(self, X_explain, levels_up=0):
+    def explain_local(self, X_explain, levels_up=0, local_method="interpolate"):
         """
         Produce ALE local explanations by routing each point through the
         connected KD-forest and looking up its path's centered g-value.
@@ -471,7 +471,22 @@ class ALE(Explanation):
         - X_explain: Points to explain (n_explain, d) or (d,).
         - levels_up: Number of levels to go up in the tree for smoothing.
                      0 = exact leaf, higher = average over more paths.
+        - local_method: How to compute the within-bin term added to g*(x_j_left):
+            - "interpolate" (default): alpha * Delta_{k,l} via linear
+              interpolation of the centered g-value curve (no extra f calls).
+            - "path_rep": mean over path members in (path l, bin k) of
+              [f(x_j, x*_\\j) - f(x_j_left, x*_\\j)]. Costs extra f evals.
+              Raises ValueError if the (path, bin) cell is empty.
+            - "self": [f(x_j, x_\\j) - f(x_j_left, x_\\j)] using the explain
+              point's own off-feature values. Costs extra f evals.
+          For categorical features, local_method is ignored and piecewise
+          lookup is used.
         """
+        if local_method not in ("interpolate", "path_rep", "self"):
+            raise ValueError(
+                f"Unknown local_method {local_method!r}; must be one of "
+                "'interpolate', 'path_rep', 'self'."
+            )
         X_explain = self._prepare_explain(X_explain)
 
         explanations = np.zeros((X_explain.shape[0], self.d))
@@ -490,15 +505,20 @@ class ALE(Explanation):
                 forest=self.connected_forest[j],
                 levels_up=levels_up,
                 edges=self.edges[j],
+                f=self.f,
+                k_x=self.k_x[j],
+                local_method=local_method,
             )
 
         return explanations
 
-    def explain_global(self, levels_up=0):
+    def explain_global(self, levels_up=0, local_method="interpolate"):
         """
         The global effect is the sample variance of the local effects across all X values.
         """
-        local_explanations = self.explain_local(self.X_values, levels_up=levels_up)
+        local_explanations = self.explain_local(
+            self.X_values, levels_up=levels_up, local_method=local_method
+        )
         return np.var(local_explanations, axis=0)
 
     def plot_connected_paths(self, feature_1, feature_2):
@@ -823,14 +843,16 @@ class BootstrapALE(Explanation):
         df.set_index(pd.Index(include), inplace=True)
         return df
 
-    def explain_local(self, X_explain, levels_up=0):
+    def explain_local(self, X_explain, levels_up=0, local_method="interpolate"):
         """
         Produce ALE local explanations using bootstrap replications.
         Averages local explanations across replications.
         """
         all_explanations = []
         for ale_r in self.ale_replications:
-            exp_r = ale_r.explain_local(X_explain, levels_up=levels_up)
+            exp_r = ale_r.explain_local(
+                X_explain, levels_up=levels_up, local_method=local_method
+            )
             all_explanations.append(exp_r)
 
         return np.mean(all_explanations, axis=0)

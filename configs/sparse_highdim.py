@@ -17,39 +17,22 @@ import hashlib
 
 from models import (
     NNModelTuner,
-    signal_basic,
-    signal_basic_explanation
+    RFModelTuner,
+    sample_X_uniform,
+    signal_hooker_2021,
+    signal_hooker_2021_explanation
 )
-from experiments import ExplainerConfig
+from experiments import ExplainerConfig, ShapConfig
 
 
-def _block_cov(rho: float) -> np.ndarray:
-    """10x10 block-diagonal covariance with two blocks of 5, within-block corr = rho."""
-    cov = np.zeros((10, 10))
-    for block in [range(0, 10, 2), range(1, 10, 2)]:  # odd indices, even indices
-        for i in block:
-            for j in block:
-                cov[i, j] = rho if i != j else 1.0
-    return cov
-
-
-def _make_sampler(rho: float):
-    cov = _block_cov(rho)
-    cov_hash = hashlib.md5(np.ascontiguousarray(cov).tobytes()).hexdigest()[:8]
-    def sample(n, rng: np.random.Generator):
-        return rng.multivariate_normal(mean=np.zeros(10), cov=cov, size=n)
-    sample.__name__ = f"sample_X_gaussian_d10_{cov_hash}"
-    return sample
-
-
-REPLICATIONS = 100
+REPLICATIONS = 10
 EXPLAIN_N = 500
 
 SIGNALS = [
-    (signal_basic, signal_basic_explanation, None),
+    (signal_hooker_2021, signal_hooker_2021_explanation, None),
 ]
 
-SNRS = [9]
+SNRS = [9, 19, 49, 99]
 
 NS = [1000]
 
@@ -57,12 +40,23 @@ ALE_CONFIGS = [
     ExplainerConfig(K=40, L=25),
 ]
 
+SHAP_CONFIGS = [
+    ShapConfig(method="tree_shap", kwargs={"npermutations": 10}),
+]
+
 RHOS = [0, 0.3, 0.5, 0.7, 0.9]
 
+def make_corr(rho):
+    corr = np.eye(10)
+    # set X_1, X_2 correlated w/ rho
+    corr[0, 1] = corr[1, 0] = rho
+    return corr
+
 SAMPLERS = [
-    ("gaussian", _make_sampler),
+    ("uniform", lambda rho: sample_X_uniform(corr=make_corr(rho), scale=[0, 1])),
 ]
 
 MODEL_TYPES = [
-    ("nn", lambda snr: NNModelTuner(cv=5, n_iter=20, verbose=False, snr=snr)),
+    # ("nn", lambda snr: NNModelTuner(cv=5, n_iter=20, verbose=False, snr=snr)),
+    ("rf", lambda snr: RFModelTuner(cv=5, n_iter=20, verbose=False, snr=snr)),
 ]

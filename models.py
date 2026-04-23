@@ -8,6 +8,7 @@ import json
 import os
 
 import numpy as np
+from scipy.stats import norm
 from sklearn.linear_model import LinearRegression
 from sklearn.neural_network import MLPRegressor
 from sklearn.ensemble import RandomForestRegressor
@@ -18,19 +19,22 @@ from sklearn.model_selection import RandomizedSearchCV
 # DGP sampling strategies
 # ---------------------------------------------------------------------------
 
-def sample_X_uniform(rho, scale, d=2):
+def sample_X_uniform(corr, scale):
     """
-    Sample d-dimensional features with controlled pairwise correlation via a shared uniform latent.
+    Sample d-dimensional uniform features via a Gaussian copula.
 
-    rho controls correlation: Cor(Xi, Xj) ≈ rho for all i≠j
-    scale controls feature spread: features are approximately in [-scale, scale]
+    corr is a dxd correlation matrix controlling the copula dependence.
+    scale is [low, high]: each marginal is Uniform(low, high).
     """
+    corr = np.array(corr, dtype=float)
+    d = corr.shape[0]
+    low, high = float(scale[0]), float(scale[1])
+    corr_hash = hashlib.md5(np.ascontiguousarray(corr).tobytes()).hexdigest()[:8]
     def sample(n, rng: np.random.Generator):
-        sigma_x = scale * np.sqrt((1 - rho) / (3 * rho))
-        x = rng.uniform(-scale, scale, size=n)
-        cols = [x + rng.normal(size=n, scale=sigma_x) for _ in range(d)]
-        return np.column_stack(cols)
-    sample.__name__ = f"sample_X_uniform_d{d}_rho{rho:g}_scale{scale:g}"
+        z = rng.multivariate_normal(mean=np.zeros(d), cov=corr, size=n)
+        u = norm.cdf(z)
+        return low + (high - low) * u
+    sample.__name__ = f"sample_X_uniform_d{d}_{corr_hash}_low{low:g}_high{high:g}"
     return sample
 
 
@@ -53,7 +57,7 @@ def signal_basic(X):
     return X[:, 0] + X[:, 1] ** 2
 
 def signal_basic_interaction(X):
-    return X[:, 0] + X[:, 1] + X[:, 0] * X[:, 1]
+    return X[:, 0] + X[:, 1] + 2 * X[:, 0] * X[:, 1]
 
 def signal_nonlinear(X):
     return X[:, 0] + np.sin(4 * X[:, 1])
@@ -85,6 +89,11 @@ def signal_abs(X):
     """abs(x1) + x2^2 — non-differentiable kink at x1=0."""
     return np.abs(X[:, 0]) + X[:, 1] ** 2
 
+def signal_hooker_2021(X):
+    """From Hooker et al. 2021"""
+    beta = np.array([1, 1, 1, 1, 1, 0, 0.5, 0.8, 1.2, 1.5])
+    return X @ beta
+
 
 # ---------------------------------------------------------------------------
 # True explanations (only for additive signals)
@@ -112,6 +121,11 @@ def signal_multiplicative_explanation(X, rho):
     phi1 = X[:, 0] + 2 * X[:, 0] * X[:, 1] - 2 * rho
     phi2 = X[:, 1] + 2 * X[:, 0] * X[:, 1] - 2 * rho
     return np.column_stack([phi1, phi2])
+
+def signal_hooker_2021_explanation(X):
+    """Shapley-value explanation for signal_hooker_2021 under U[0, 1]."""
+    beta = np.array([1, 1, 1, 1, 1, 0, 0.5, 0.8, 1.2, 1.5])
+    return X * beta - 0.5 * beta
 
 # ---------------------------------------------------------------------------
 # Model factory functions
@@ -254,10 +268,10 @@ class RFModelTuner:
     experiment = Experiment(..., fit_model=rf_model, fit_model_slug=rf_model.__name__)
     """
     _param_dist = {
-        "n_estimators": [100, 200, 300],
-        "max_depth": [None, 5, 10, 20],
-        "min_samples_split": [2, 5, 10],
-        "max_features": ["sqrt", 0.5, 1.0],
+        "n_estimators": [100, 500, 1000, 2000],
+        "max_depth": [None, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16],
+        "min_samples_split": [2, 5, 10, 20],
+        "max_features": ["sqrt", "log2", 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
         "min_samples_leaf": [1, 2, 5],
     }
 

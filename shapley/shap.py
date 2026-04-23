@@ -37,6 +37,9 @@ class SHAP(Explanation):
         sample_size=1000,
         random_state=None
     ):
+        if kwargs is None:
+            kwargs = {}
+
         # convert X_explain to numpy array if it's a pandas Series
         if isinstance(X_explain, pd.Series):
             X_explain = X_explain.values
@@ -45,11 +48,12 @@ class SHAP(Explanation):
         if X_explain.ndim == 1:
             X_explain = X_explain[np.newaxis, :]
 
+        rng = check_random_state(random_state)
+
         # sample from X_values if sample is not None
         if sample_method == "kmeans":
             X_values = kmeans(self.X_values, sample_size).data
         elif sample_method == "sample":
-            rng = check_random_state(random_state)
             X_values = sample(self.X_values, sample_size, random_state=rng)
         else:
             X_values = self.X_values
@@ -62,9 +66,8 @@ class SHAP(Explanation):
                 explainer = PermutationExplainer(
                     self.f, masker, feature_names=self.feature_names
                 )
-                shap_values = explainer.shap_values(X_explain, **kwargs)[
-                    0
-                ]
+                # expects npermutations
+                shap_values = explainer.shap_values(X_explain, **kwargs)
         elif method == "kernel_shap":
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -73,7 +76,7 @@ class SHAP(Explanation):
                 )
                 shap_values = explainer.shap_values(
                     X_explain, silent=True, **kwargs
-                )[0]
+                )
         elif method == "tree_shap":
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -134,6 +137,7 @@ class SHAP(Explanation):
         kwargs=None,
         sample_method=None,
         sample_size=1000,
+        random_state=None,
     ):
         """
         The global effect is the average of the absolute values of the local effects.
@@ -144,6 +148,7 @@ class SHAP(Explanation):
             kwargs=kwargs,
             sample_method=sample_method,
             sample_size=sample_size,
+            random_state=random_state,
         )
 
         return np.mean(np.abs(local_effects), axis=0)

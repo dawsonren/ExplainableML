@@ -2,13 +2,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import hashlib
 import os
+import time
 import joblib
 
 import numpy as np
 
 from ale import ALE, BootstrapALE
-
-SAVE_DIR = "cached_explanations"
+from shapley import SHAP
 
 
 @dataclass
@@ -58,10 +58,10 @@ class Experiment:
         """Sample from the DGP."""
         return self.dgp.sample(n=self.n, rng=rng)
 
-    def fit_models(self, rng: np.random.Generator) -> list[tuple[np.ndarray, np.ndarray, object]]:
+    def fit_models(self, rng: np.random.Generator, cache_dir: str) -> list[tuple[np.ndarray, np.ndarray, object]]:
         """Fit models for each replication. Returns list of (X, y, fitted_model)."""
         if self.save:
-            path = f"{SAVE_DIR}/run_{self.slug()}.pkl"
+            path = os.path.join(cache_dir, f"run_{self.slug()}.pkl")
             try:
                 return joblib.load(path)
             except FileNotFoundError:
@@ -73,13 +73,18 @@ class Experiment:
             results.append((X, y, model))
 
         if self.save:
-            self.save_run(results)
+            self.save_run(results, cache_dir)
         return results
 
-    def save_run(self, results: list[tuple[np.ndarray, np.ndarray, object]]) -> None:
+    def save_run(self, results: list[tuple[np.ndarray, np.ndarray, object]], cache_dir: str) -> None:
         """Save all replications to a single file."""
-        os.makedirs(SAVE_DIR, exist_ok=True)
-        joblib.dump(results, f"{SAVE_DIR}/run_{self.slug()}.pkl")
+        os.makedirs(cache_dir, exist_ok=True)
+        joblib.dump(results, os.path.join(cache_dir, f"run_{self.slug()}.pkl"))
+
+
+def _md5_of(parts: dict) -> str:
+    key_str = "__".join(f"{k}={v}" for k, v in sorted(parts.items()))
+    return hashlib.md5(key_str.encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -98,6 +103,7 @@ class ExplainerConfig:
     edges: Optional[dict] = None  # dict mapping 1-based feature index -> edges array
     variant: str = "standard"     # "standard" or "bootstrap"
     n_bootstrap: int = 50         # bootstrap replications (variant="bootstrap" only)
+    local_method: str = "interpolate"  # "interpolate", "path_rep", or "self"
     tag: Optional[str] = None     # human-readable filename label; auto-generated if None
 
     @property
@@ -105,6 +111,8 @@ class ExplainerConfig:
         base = f"K{self.K}_L{self.L}_{self.centering}"
         if self.levels_up != 0:
             base += f"_lu{self.levels_up}"
+        if self.local_method != "interpolate":
+            base += f"_{self.local_method}"
         if self.variant == "bootstrap":
             base = f"bale_{base}_nb{self.n_bootstrap}"
         return base
@@ -112,153 +120,215 @@ class ExplainerConfig:
     def get_tag(self) -> str:
         return self.tag if self.tag is not None else self.auto_tag
 
+    def cache_key(self) -> str:
+        return _md5_of({
+            "K": self.K,
+            "L": self.L,
+            "centering": self.centering,
+            "interpolate": self.interpolate,
+            "knn_smooth": self.knn_smooth,
+            "levels_up": self.levels_up,
+            "edges": str(self.edges),
+            "variant": self.variant,
+            "n_bootstrap": self.n_bootstrap,
+            "local_method": self.local_method,
+        })
+
 
 @dataclass
-class RunConfig:
+class ShapConfig:
     """
-    Ties together an Experiment, an ExplainerConfig, and grid settings for
-    a single run of the ALE bias/variance experiment.
-
-    Usage
-    -----
-    config = RunConfig(experiment=exp, explainer_config=ec, replications=25)
-    results = config.run_ale()
+    All hyperparameters that control how SHAP explanations are produced.
     """
-    experiment: Experiment
-    explainer_config: ExplainerConfig
-    seed: int = 42
+    method: str = "exact_shap"            # permutation_shap / kernel_shap / tree_shap / exact_shap / linear_shap
+    kwargs: dict = field(default_factory=dict)
+    sample_method: Optional[str] = None   # None / "kmeans" / "sample"
+    sample_size: int = 1000
+    random_state: int = 42
+    tag: Optional[str] = None
 
-    def cache_key(self, grid: "np.ndarray | None" = None) -> str:
-        """Deterministic MD5 hash of all fields that affect output arrays."""
-        ec = self.explainer_config
-        parts = {
-            "dgp": self.experiment.dgp_slug,
-            "fit": self.experiment.fit_model_slug,
-            "n": self.experiment.n,
-            "R": self.experiment.replications,
-            "K": ec.K,
-            "L": ec.L,
-            "centering": ec.centering,
-            "interpolate": ec.interpolate,
-            "knn_smooth": ec.knn_smooth,
-            "levels_up": ec.levels_up,
-            "edges": str(ec.edges),
-            "variant": ec.variant,
-            "n_bootstrap": ec.n_bootstrap,
-            "seed": self.seed,
-        }
-        if grid is not None:
-            parts["grid"] = hashlib.md5(np.ascontiguousarray(grid).tobytes()).hexdigest()[:8]
-        key_str = "__".join(f"{k}={v}" for k, v in parts.items())
-        return hashlib.md5(key_str.encode()).hexdigest()[:12]
+    @property
+    def auto_tag(self) -> str:
+        short = {
+            "exact_shap": "exact",
+            "permutation_shap": "perm",
+            "kernel_shap": "kernel",
+            "tree_shap": "tree",
+            "linear_shap": "linear",
+        }.get(self.method, self.method)
+        base = short
+        if self.sample_method is not None:
+            base += f"_{self.sample_method}{self.sample_size}"
+        return base
 
-    def cache_path(self, grid: "np.ndarray | None" = None, cache_dir: str = SAVE_DIR) -> str:
-        ec = self.explainer_config
-        name = (
-            f"ale_{self.experiment.dgp_slug}_{self.experiment.fit_model_slug}"
-            f"_n{self.experiment.n}_R{self.experiment.replications}"
-            f"_{ec.get_tag()}"
-            f"_{self.cache_key(grid)}.npz"
-        )
-        return os.path.join(cache_dir, name)
+    def get_tag(self) -> str:
+        return self.tag if self.tag is not None else self.auto_tag
 
-    def run_ale(self, grid, cache_dir: str = SAVE_DIR) -> dict:
-        """
-        Run the ALE bias/variance experiment and return a dict of result arrays.
+    def cache_key(self) -> str:
+        return _md5_of({
+            "method": self.method,
+            "kwargs": str(sorted((self.kwargs or {}).items())),
+            "sample_method": self.sample_method,
+            "sample_size": self.sample_size,
+            "random_state": self.random_state,
+        })
 
-        Loads from cache if available; otherwise runs all replications and saves.
 
-        Returned keys
-        -------------
-        ale_exps : (replications, grid_resolution, d)  local explanations per replication
-        ale_exps_mean : (grid_resolution, d)            mean across replications
-        ale_exps_std  : (grid_resolution, d)            std across replications
-        ale_times : (replications,)                     time per explained point
-        ale_tree_times : (replications,)                tree construction time
-        grid : (grid_resolution, d)                     the diagonal grid used
-        edges : dict mapping feature index (0-based) -> edges array from last replication
-        """
-        path = self.cache_path(grid, cache_dir)
-        if os.path.exists(path):
-            data = np.load(path, allow_pickle=True)
-            return {k: data[k] for k in data.files}
+# ---------------------------------------------------------------------------
+# Merged results pickle
+# ---------------------------------------------------------------------------
 
-        os.makedirs(cache_dir, exist_ok=True)
-        ec = self.explainer_config
+def results_path(experiment: "Experiment", cache_dir: str) -> str:
+    return os.path.join(cache_dir, f"results_{experiment.slug()}.pkl")
 
-        rng = np.random.default_rng(self.seed)
-        data_and_models = self.experiment.fit_models(rng)
 
-        # Use only the requested number of replications (may be < experiment.replications)
-        runs = data_and_models[: self.experiment.replications]
+def load_results(experiment: "Experiment", cache_dir: str) -> dict:
+    """Load the merged results pickle for an experiment, or an empty shell if missing."""
+    path = results_path(experiment, cache_dir)
+    if os.path.exists(path):
+        return joblib.load(path)
+    return {
+        "experiment_meta": {
+            "dgp_slug": experiment.dgp_slug,
+            "fit_model_slug": experiment.fit_model_slug,
+            "n": experiment.n,
+            "replications": experiment.replications,
+        },
+        "explain_grid": None,
+        "f_vals": None,
+        "ale": {},
+        "shap": {},
+    }
 
-        ale_exps = []
-        ale_times = []
-        ale_tree_times = []
-        last_edges = {}
 
-        import time
-        from tqdm import tqdm
+def save_results(results: dict, experiment: "Experiment", cache_dir: str) -> None:
+    """Atomically write the merged results pickle."""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = results_path(experiment, cache_dir)
+    tmp = path + ".tmp"
+    joblib.dump(results, tmp)
+    os.replace(tmp, path)
 
-        for r, (X, y, model) in enumerate(tqdm(runs, desc="ALE replications", position=1, leave=False)):
+
+# ---------------------------------------------------------------------------
+# Replication runners
+# ---------------------------------------------------------------------------
+
+def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.ndarray,
+                cache_dir: str, seed: int = 42) -> dict:
+    """Run ALE over all replications and return a sub-dict for the results pickle."""
+    from tqdm import tqdm
+
+    rng = np.random.default_rng(seed)
+    runs = experiment.fit_models(rng, cache_dir)[: experiment.replications]
+
+    exps, times, tree_times = [], [], []
+    for X, _, model in tqdm(runs, desc=f"ALE[{ec.get_tag()}]", position=1, leave=False):
+        f = model.predict
+
+        t0 = time.perf_counter()
+        if ec.variant == "bootstrap":
+            ale = BootstrapALE(
+                f, X,
+                replications=ec.n_bootstrap,
+                K=ec.K, L=ec.L,
+                centering=ec.centering,
+                interpolate=ec.interpolate,
+                knn_smooth=ec.knn_smooth,
+                verbose=False,
+            )
+            ale.explain(include=("total_connected",))
+        else:
+            ale = ALE(
+                f, X,
+                K=ec.K, L=ec.L,
+                centering=ec.centering,
+                interpolate=ec.interpolate,
+                knn_smooth=ec.knn_smooth,
+                edges=ec.edges,
+                verbose=False,
+            )
+            ale.explain(include=("total_connected",))
+        tree_time = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        exp_r = ale.explain_local(explain_grid, levels_up=ec.levels_up, local_method=ec.local_method)
+        explain_time = time.perf_counter() - t0
+
+        exps.append(exp_r)
+        times.append((tree_time + explain_time) / explain_grid.shape[0])
+        tree_times.append(tree_time)
+
+    return {
+        "exps": np.asarray(exps),
+        "times": np.asarray(times),
+        "tree_times": np.asarray(tree_times),
+        "config": ec,
+        "cache_key": ec.cache_key(),
+    }
+
+
+def compute_shap(experiment: "Experiment", sc: ShapConfig, explain_grid: np.ndarray,
+                 cache_dir: str, seed: int = 42) -> dict:
+    """Run SHAP over all replications and return a sub-dict for the results pickle."""
+    from tqdm import tqdm
+
+    rng = np.random.default_rng(seed)
+    runs = experiment.fit_models(rng, cache_dir)[: experiment.replications]
+
+    exps, times = [], []
+    for X, _, model in tqdm(runs, desc=f"SHAP[{sc.get_tag()}]", position=1, leave=False):
+        # TreeExplainer and LinearExplainer need the sklearn model object,
+        # not the predict function.
+        if sc.method in ("tree_shap", "linear_shap"):
+            f = model
+        else:
             f = model.predict
-
-            t0 = time.perf_counter()
-            if ec.variant == "bootstrap":
-                ale = BootstrapALE(
-                    f, X,
-                    replications=ec.n_bootstrap,
-                    K=ec.K,
-                    L=ec.L,
-                    centering=ec.centering,
-                    interpolate=ec.interpolate,
-                    knn_smooth=ec.knn_smooth,
-                    verbose=False,
-                )
-                ale.explain(include=("total_connected",))
-                last_edges = ale.ale_replications[0].edges
-            else:
-                ale = ALE(
-                    f, X,
-                    K=ec.K,
-                    L=ec.L,
-                    centering=ec.centering,
-                    interpolate=ec.interpolate,
-                    knn_smooth=ec.knn_smooth,
-                    edges=ec.edges,
-                    verbose=False,
-                )
-                ale.explain(include=("total_connected",))
-                last_edges = ale.edges
-            tree_time = time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            exps = ale.explain_local(grid, levels_up=ec.levels_up)
-            explain_time = time.perf_counter() - t0
-
-            ale_exps.append(exps)
-            ale_times.append((tree_time + explain_time) / grid.shape[0])
-            ale_tree_times.append(tree_time)
-
-        ale_exps = np.array(ale_exps)
-
-        results = {
-            "ale_exps": ale_exps,
-            "ale_exps_mean": ale_exps.mean(axis=0),
-            "ale_exps_std": ale_exps.std(axis=0),
-            "ale_times": np.array(ale_times),
-            "ale_tree_times": np.array(ale_tree_times),
-            "grid": grid,
-        }
-        np.savez(
-            path, **results,
-            edges=np.array([last_edges], dtype=object),
-            meta_K=np.array(ec.K),
-            meta_L=np.array(ec.L),
-            meta_centering=np.array(ec.centering),
-            meta_levels_up=np.array(ec.levels_up),
-            meta_variant=np.array(ec.variant),
-            meta_n_bootstrap=np.array(ec.n_bootstrap),
-            meta_tag=np.array(ec.get_tag()),
+        shapley = SHAP(f, X, verbose=False)
+        t0 = time.perf_counter()
+        exp_r = shapley.explain_local(
+            explain_grid,
+            method=sc.method,
+            kwargs=sc.kwargs,
+            sample_method=sc.sample_method,
+            sample_size=sc.sample_size,
+            random_state=sc.random_state,
         )
-        return results
+        elapsed = time.perf_counter() - t0
+
+        exps.append(np.asarray(exp_r))
+        times.append(elapsed / explain_grid.shape[0])
+
+    return {
+        "exps": np.asarray(exps),
+        "times": np.asarray(times),
+        "config": sc,
+        "cache_key": sc.cache_key(),
+    }
+
+
+def compute_f_vals(experiment: "Experiment", explain_grid: np.ndarray,
+                   cache_dir: str, seed: int = 42) -> np.ndarray:
+    """Cheap pass: model predictions on the explain grid, (R, explain_n)."""
+    rng = np.random.default_rng(seed)
+    runs = experiment.fit_models(rng, cache_dir)[: experiment.replications]
+    return np.asarray([model.predict(explain_grid) for _, _, model in runs])
+
+
+# ---------------------------------------------------------------------------
+# Bias/variance (computed on demand from stored explanations)
+# ---------------------------------------------------------------------------
+
+def compute_bias_variance(exps: np.ndarray, true_explanation: Optional[np.ndarray]) -> dict:
+    """
+    Given explanations of shape (R, explain_n, d) and optional ground-truth
+    explanations of shape (explain_n, d), return mean bias² and stddev per dim,
+    averaged over the explain grid.
+    """
+    stddev = exps.std(axis=0).mean(axis=0)  # (d,)
+    if true_explanation is None:
+        d = exps.shape[-1]
+        bias2 = np.full(d, np.nan)
+    else:
+        bias2 = ((exps.mean(axis=0) - true_explanation) ** 2).mean(axis=0)
+    return {"bias2": np.asarray(bias2), "stddev": np.asarray(stddev)}
