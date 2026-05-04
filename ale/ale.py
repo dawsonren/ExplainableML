@@ -30,6 +30,7 @@ class ALE(Explanation):
         centering="x",
         knn_smooth=None,
         edges=None,
+        random_seed=42,
     ):
         """
         Initialize the ALE object.
@@ -47,6 +48,9 @@ class ALE(Explanation):
         - knn_smooth: if set, smooth deltas within each bin using KNN averaging.
         - edges: optional dict mapping 1-indexed feature index to edges array.
                  Features not in the dict will have edges calculated as usual.
+        - random_seed: seed used by method='random' path generation. Per-feature
+                 seed is derived as random_seed + feature_idx so different
+                 features get different random partitions but are reproducible.
         """
         super().__init__(f, X, feature_names, categorical, log_queries=False)
 
@@ -65,6 +69,7 @@ class ALE(Explanation):
         self.interpolate = interpolate
         self.centering = centering
         self.knn_smooth = knn_smooth
+        self.random_seed = random_seed
         # wrap f to handle categorical feature conversion
         self.original_f = f
         self.f = self._wrap_convert_function(self.f)
@@ -104,6 +109,10 @@ class ALE(Explanation):
         # keep track of raw deltas and bin assignments for each feature
         self.deltas = {}
         self.k_x = {}
+        # lazy cache of f(self.X_values) — populated on first path_integral call
+        # and shared across features. Invariant: depends only on (f, X), so safe
+        # to keep for the lifetime of the ALE object.
+        self._f_X_cache = None
 
     def _wrap_convert_function(self, f):
         """
@@ -360,14 +369,19 @@ class ALE(Explanation):
 
         Parameters:
         - feature: 1-based index or feature name.
-        - method: "connected" or "quantile" for path generation.
+        - method: "connected", "quantile", or "random" for path generation.
 
         Returns:
         - The total ALE VIM value.
         """
         idx = self._get_feature_index(feature)
-        if method not in ["connected", "quantile"]:
-            raise ValueError("Method must be either 'connected' or 'quantile'.")
+        if method not in ["connected", "quantile", "random"]:
+            raise ValueError("Method must be 'connected', 'quantile', or 'random'.")
+
+        seed = None
+        if method == "random":
+            # per-feature offset so different features get different partitions
+            seed = self.random_seed + idx
 
         (
             total_vim,
@@ -391,11 +405,15 @@ class ALE(Explanation):
             centering=self.centering,
             edges=self.edges[idx],
             knn_smooth=self.knn_smooth,
+            seed=seed,
         )
-        # store the generated paths for potential reuse
-        if method == "connected":
+        # store the generated paths for potential reuse. Both connected and
+        # random produce a `paths` structure; random has no forest (local
+        # explanations are not supported for random).
+        if method in ("connected", "random"):
             self.connected_paths[idx] = paths
-            self.connected_forest[idx] = forest
+            if forest is not None:
+                self.connected_forest[idx] = forest
             self.g_values[idx] = g_values
             self.centered_g_values[idx] = centered_g_values
             self.observation_to_path[idx] = observation_to_path
@@ -409,18 +427,16 @@ class ALE(Explanation):
 
         Parameters:
         - include: A tuple specifying which explanations to include.
-                   Options are 'main', 'total_quantile', 'total_connected'.
+                   Options are 'main', 'total_quantile', 'total_connected', 'total_random'.
                    Default is ('main', 'total_quantile', 'total_connected').
 
         Returns:
         - A pandas DataFrame containing the explanations for each feature.
         """
-        if not (
-            set(include)
-            <= set(("main", "total_quantile", "total_connected"))
-        ):
+        allowed = ("main", "total_quantile", "total_connected", "total_random")
+        if not set(include) <= set(allowed):
             raise ValueError(
-                'Included explanations must belong to the set ("main", "total_quantile", "total_connected").'
+                f"Included explanations must belong to the set {allowed}."
             )
 
         explanations = {}
@@ -440,6 +456,10 @@ class ALE(Explanation):
             if "total_connected" in include:
                 explanation_i["total_connected"] = np.sqrt(
                     self.ale_total_vim(i + 1, method="connected")
+                )
+            if "total_random" in include:
+                explanation_i["total_random"] = np.sqrt(
+                    self.ale_total_vim(i + 1, method="random")
                 )
 
             explanations[self.feature_names[i]] = explanation_i
@@ -462,7 +482,22 @@ class ALE(Explanation):
                 )
         return X_explain
 
-    def explain_local(self, X_explain, levels_up=0, local_method="interpolate"):
+    def _get_f_X(self):
+        """Lazily compute and cache f(self.X_values). Reused across features
+        and across calls within the lifetime of this ALE object."""
+        if self._f_X_cache is None:
+            self._f_X_cache = np.asarray(self.f(self.X_values)).ravel()
+        return self._f_X_cache
+
+    def explain_local(
+        self,
+        X_explain,
+        levels_up=0,
+        local_method="interpolate",
+        background_size=None,
+        background_seed=None,
+        boundary_interp=False,
+    ):
         """
         Produce ALE local explanations by routing each point through the
         connected KD-forest and looking up its path's centered g-value.
@@ -481,13 +516,47 @@ class ALE(Explanation):
               point's own off-feature values. Costs extra f evals.
           For categorical features, local_method is ignored and piecewise
           lookup is used.
+            - "path_integral": for each background x in self.X_values, walk
+              through ALE bins from x_j to x*_j, accumulating partial-bin
+              f-differences at the endpoints and pre-computed deltas at
+              interpolated middle bins (off-j coords linearly interpolated,
+              routed to the nearest training index via the forest). Returns
+              the mean over the background. Does not use g_values.
+        - background_size: only used by local_method='path_integral'. If set
+          and < n, average over a random subsample of size background_size of
+          self.X_values rather than the full training set. Reduces cost
+          linearly in this size. Forest, deltas, and f(X) cache are still
+          built/computed on the full training set.
+        - background_seed: RNG seed for the background subsample. Defaults to
+          self.random_seed.
+        - boundary_interp: only used by local_method='path_integral'. If True,
+          replace the partial-bin f-evaluations at x's and x*'s bins with a
+          linear-interpolation approximation that scales the routed
+          observation's full-bin delta. Eliminates all f-calls during
+          explain_local at the cost of some accuracy. Recommended when f is
+          expensive (NNs, RFs).
         """
-        if local_method not in ("interpolate", "path_rep", "self"):
+        if local_method not in ("interpolate", "path_rep", "self", "path_integral"):
             raise ValueError(
                 f"Unknown local_method {local_method!r}; must be one of "
-                "'interpolate', 'path_rep', 'self'."
+                "'interpolate', 'path_rep', 'self', 'path_integral'."
             )
         X_explain = self._prepare_explain(X_explain)
+
+        # path_integral-only: pre-compute f(X) cache and background subsample
+        f_X = None
+        background_indices = None
+        if local_method == "path_integral":
+            # f(X) cache is only useful when boundary_interp=False (it's only
+            # consumed by the f-eval boundary mode); skip the eval otherwise.
+            if not boundary_interp:
+                f_X = self._get_f_X()
+            if background_size is not None and background_size < self.n:
+                seed = self.random_seed if background_seed is None else background_seed
+                rng = np.random.default_rng(seed)
+                background_indices = rng.choice(
+                    self.n, size=int(background_size), replace=False
+                )
 
         explanations = np.zeros((X_explain.shape[0], self.d))
         for j in range(self.d):
@@ -508,6 +577,10 @@ class ALE(Explanation):
                 f=self.f,
                 k_x=self.k_x[j],
                 local_method=local_method,
+                deltas=self.deltas[j],
+                f_X=f_X,
+                background_indices=background_indices,
+                boundary_interp=boundary_interp,
             )
 
         return explanations
@@ -743,6 +816,7 @@ class BootstrapALE(Explanation):
         centering="x",
         knn_smooth=None,
         seed=None,
+        random_seed=42,
     ):
         """
         Initialize the BootstrapALE object.
@@ -776,6 +850,7 @@ class BootstrapALE(Explanation):
         self.centering = centering
         self.knn_smooth = knn_smooth
         self.seed = 42 if seed is None else seed
+        self.random_seed = random_seed
 
         # create ALE objects for each replication
         if replications > 1:
@@ -796,6 +871,7 @@ class BootstrapALE(Explanation):
                     interpolate=self.interpolate,
                     centering=self.centering,
                     knn_smooth=self.knn_smooth,
+                    random_seed=self.random_seed,
                 )
                 self.ale_replications.append(ale_r)
         else:
@@ -811,6 +887,7 @@ class BootstrapALE(Explanation):
                     interpolate=self.interpolate,
                     centering=self.centering,
                     knn_smooth=self.knn_smooth,
+                    random_seed=self.random_seed,
                 )
             ]
 
@@ -820,7 +897,7 @@ class BootstrapALE(Explanation):
 
         Parameters:
         - include: A tuple specifying which explanations to include.
-                   Options are 'main', 'total_quantile', 'total_connected'.
+                   Options are 'main', 'total_quantile', 'total_connected', 'total_random'.
                    Default is ('main', 'total_quantile', 'total_connected').
 
         Returns:
@@ -843,7 +920,15 @@ class BootstrapALE(Explanation):
         df.set_index(pd.Index(include), inplace=True)
         return df
 
-    def explain_local(self, X_explain, levels_up=0, local_method="interpolate"):
+    def explain_local(
+        self,
+        X_explain,
+        levels_up=0,
+        local_method="interpolate",
+        background_size=None,
+        background_seed=None,
+        boundary_interp=False,
+    ):
         """
         Produce ALE local explanations using bootstrap replications.
         Averages local explanations across replications.
@@ -851,7 +936,12 @@ class BootstrapALE(Explanation):
         all_explanations = []
         for ale_r in self.ale_replications:
             exp_r = ale_r.explain_local(
-                X_explain, levels_up=levels_up, local_method=local_method
+                X_explain,
+                levels_up=levels_up,
+                local_method=local_method,
+                background_size=background_size,
+                background_seed=background_seed,
+                boundary_interp=boundary_interp,
             )
             all_explanations.append(exp_r)
 

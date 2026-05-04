@@ -103,16 +103,29 @@ class ExplainerConfig:
     edges: Optional[dict] = None  # dict mapping 1-based feature index -> edges array
     variant: str = "standard"     # "standard" or "bootstrap"
     n_bootstrap: int = 50         # bootstrap replications (variant="bootstrap" only)
-    local_method: str = "interpolate"  # "interpolate", "path_rep", or "self"
+    local_method: str = "interpolate"  # "interpolate", "path_rep", "self", or "path_integral"
+    method: str = "connected"     # path-generation method: "connected", "quantile", "random"
+    random_seed: int = 42         # seed for method="random" path partitioning
+    background_size: Optional[int] = None  # path_integral only: size of background subsample (None = full X)
+    background_seed: Optional[int] = None  # path_integral only: RNG seed for the subsample (None = use random_seed)
+    boundary_interp: bool = False  # path_integral only: replace boundary f-evals with linear-interp of routed deltas
     tag: Optional[str] = None     # human-readable filename label; auto-generated if None
 
     @property
     def auto_tag(self) -> str:
         base = f"K{self.K}_L{self.L}_{self.centering}"
+        if self.method == "quantile":
+            base += "_quant"
+        elif self.method == "random":
+            base += f"_rand_s{self.random_seed}"
         if self.levels_up != 0:
             base += f"_lu{self.levels_up}"
         if self.local_method != "interpolate":
             base += f"_{self.local_method}"
+        if self.local_method == "path_integral" and self.background_size is not None:
+            base += f"_bg{self.background_size}"
+        if self.local_method == "path_integral" and self.boundary_interp:
+            base += "_binterp"
         if self.variant == "bootstrap":
             base = f"bale_{base}_nb{self.n_bootstrap}"
         return base
@@ -132,6 +145,11 @@ class ExplainerConfig:
             "variant": self.variant,
             "n_bootstrap": self.n_bootstrap,
             "local_method": self.local_method,
+            "method": self.method,
+            "random_seed": self.random_seed,
+            "background_size": self.background_size,
+            "background_seed": self.background_seed,
+            "boundary_interp": self.boundary_interp,
         })
 
 
@@ -222,6 +240,8 @@ def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.
     rng = np.random.default_rng(seed)
     runs = experiment.fit_models(rng, cache_dir)[: experiment.replications]
 
+    include_key = f"total_{ec.method}"
+
     exps, times, tree_times = [], [], []
     for X, _, model in tqdm(runs, desc=f"ALE[{ec.get_tag()}]", position=1, leave=False):
         f = model.predict
@@ -235,9 +255,10 @@ def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.
                 centering=ec.centering,
                 interpolate=ec.interpolate,
                 knn_smooth=ec.knn_smooth,
+                random_seed=ec.random_seed,
                 verbose=False,
             )
-            ale.explain(include=("total_connected",))
+            ale.explain(include=(include_key,))
         else:
             ale = ALE(
                 f, X,
@@ -246,13 +267,26 @@ def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.
                 interpolate=ec.interpolate,
                 knn_smooth=ec.knn_smooth,
                 edges=ec.edges,
+                random_seed=ec.random_seed,
                 verbose=False,
             )
-            ale.explain(include=("total_connected",))
+            ale.explain(include=(include_key,))
         tree_time = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        exp_r = ale.explain_local(explain_grid, levels_up=ec.levels_up, local_method=ec.local_method)
+        if ec.method == "random":
+            # Local explanations are not supported for random paths; fill NaN so
+            # downstream bias/variance code still has a tensor of the right shape.
+            exp_r = np.full((explain_grid.shape[0], X.shape[1]), np.nan)
+        else:
+            exp_r = ale.explain_local(
+                explain_grid,
+                levels_up=ec.levels_up,
+                local_method=ec.local_method,
+                background_size=ec.background_size,
+                background_seed=ec.background_seed,
+                boundary_interp=ec.boundary_interp,
+            )
         explain_time = time.perf_counter() - t0
 
         exps.append(exp_r)

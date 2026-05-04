@@ -111,6 +111,10 @@ def _build_paths_ale(cache_dir: str, config_name: str, results_file: str, ale_ta
     if ale_entry is None or ale_entry.get("config") is None:
         return None
     ec = ale_entry["config"]
+    # `method` is a newer field; default to "connected" for older cached configs.
+    method = getattr(ec, "method", "connected")
+    random_seed = getattr(ec, "random_seed", 42)
+    include_key = f"total_{method}"
 
     runs = _load_all_replications(cache_dir, config_name, results_file)
     if runs is None:
@@ -122,13 +126,15 @@ def _build_paths_ale(cache_dir: str, config_name: str, results_file: str, ale_ta
             model.predict, X,
             replications=ec.n_bootstrap,
             K=ec.K, L=ec.L, centering=ec.centering,
-            interpolate=ec.interpolate, verbose=False,
+            interpolate=ec.interpolate,
+            random_seed=random_seed,
+            verbose=False,
         )
-        ale_obj.explain(include=("total_connected",))
+        ale_obj.explain(include=(include_key,))
         return ale_obj.ale_replications[0]
     ale = ALE(model.predict, X, K=ec.K, L=ec.L, centering=ec.centering,
-              interpolate=ec.interpolate, verbose=False)
-    ale.explain(include=("total_connected",))
+              interpolate=ec.interpolate, random_seed=random_seed, verbose=False)
+    ale.explain(include=(include_key,))
     return ale
 
 
@@ -469,7 +475,7 @@ def _render_interactive_section(cache_dir, config_name, results_file, row_meta) 
     rows = []
 
     # Final ALE values (all three methods)
-    for method in ("interpolate", "path_rep", "self"):
+    for method in ("interpolate", "path_rep", "self", "path_integral"):
         try:
             terms = ale.explain_local(
                 x_query, levels_up=int(levels_up), local_method=method
