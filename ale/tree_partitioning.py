@@ -29,8 +29,16 @@ class KDNode:
     # topology
     left: Optional["KDNode"] = None
     right: Optional["KDNode"] = None
+    parent: Optional["KDNode"] = None
     # bookkeeping for routing/inspection
     R: Optional[list] = None  # list of length K; each is list[int] (indices into X)
+    # precomputed per-bin subtree stats (multi_path).
+    # mean_delta[k] = mean of training-point deltas over leaves of this node's
+    # subtree restricted to interval k. nan if the (node, k) cell is empty.
+    # n_per_bin[k] = number of training points (unique) in this node's subtree
+    # at interval k.
+    mean_delta: Optional[np.ndarray] = None
+    n_per_bin: Optional[np.ndarray] = None
 
     @property
     def is_leaf(self) -> bool:
@@ -87,60 +95,54 @@ class ConnectedKDForest:
             xj, self.edges, self.K, categorical=self.categorical[self.feature_idx]
         ))
 
-    def _collect_leaf_indices(self, node: Optional[KDNode], k: int) -> np.ndarray:
+    def route(self, x_new: np.ndarray) -> Dict[str, object]:
         """
-        Collect all training indices for interval k from all leaf nodes
-        in the subtree rooted at `node`.
-        """
-        if node is None:
-            return np.array([], dtype=int)
-
-        if node.is_leaf:
-            return node.leaf_indices_for_k(k)
-
-        left_idxs = self._collect_leaf_indices(node.left, k)
-        right_idxs = self._collect_leaf_indices(node.right, k)
-
-        if left_idxs.size == 0:
-            return right_idxs
-        if right_idxs.size == 0:
-            return left_idxs
-        return np.concatenate([left_idxs, right_idxs])
-
-    def route(self, x_new: np.ndarray, levels_up: int = 0) -> Dict[str, object]:
-        """
-        Route a new point and return node info.
-
-        Args
-        ----
-        x_new : np.ndarray
-            New sample.
-        levels_up : int, default 0
-            0 -> return the leaf node (original behavior).
-            1 -> return the parent of the leaf,
-            2 -> grandparent, etc.
-            If levels_up is larger than the depth of the leaf, the root is returned.
+        Route a new point and return the leaf node info.
 
         Returns
         -------
         dict with keys:
-          - 'k': int
-                0-based interval for x_j.
-          - 'node': KDNode
-                The node at the requested height (may be internal or leaf).
-          - 'indices': np.ndarray
-                All training indices (for interval k) in all leaves below that node.
+          - 'k': int — 0-based interval for x_j.
+          - 'node': KDNode — the reached leaf.
+          - 'indices': np.ndarray — training indices in the leaf for interval k.
         """
         if self.root is None:
             raise RuntimeError("Forest not built yet")
 
-        if levels_up < 0:
-            raise ValueError("levels_up must be >= 0")
-
         x_new = self._convert_x_new(x_new)
         k = self._bin_for_xj(x_new)
 
-        # Descend the tree while keeping track of the path
+        node = self.root
+        while not node.is_leaf:
+            m = node.split_feature
+            thr = node.thresholds[k]
+            val = x_new[m]
+            node = node.left if val < thr else node.right
+
+        return {
+            "k": k,
+            "node": node,
+            "indices": node.leaf_indices_for_k(k),
+        }
+
+    def route_with_path(self, x_new: np.ndarray, k: Optional[int] = None) -> Dict[str, object]:
+        """
+        Route x_new through the tree at its interval k (computed from x_new if
+        not provided) and return the full descent path (root → ... → leaf) plus
+        the resulting leaf.
+
+        Returns dict with keys:
+          - 'k': int — 0-based interval used for routing.
+          - 'leaf': KDNode — the leaf reached.
+          - 'path': list[KDNode] — the descent path from root to leaf.
+        """
+        if self.root is None:
+            raise RuntimeError("Forest not built yet")
+
+        x_new = self._convert_x_new(x_new)
+        if k is None:
+            k = self._bin_for_xj(x_new)
+
         path: list[KDNode] = []
         node = self.root
         while not node.is_leaf:
@@ -149,29 +151,136 @@ class ConnectedKDForest:
             thr = node.thresholds[k]
             val = x_new[m]
             node = node.left if val < thr else node.right
-
-        # Include the final leaf in the path
         path.append(node)
 
-        # Choose the node `levels_up` above the leaf, clamped at root
-        target_depth_index = max(0, len(path) - 1 - levels_up)
-        target_node = path[target_depth_index]
+        return {"k": int(k), "leaf": node, "path": path}
 
-        # Collect all indices for all leaves below target_node for interval k
-        indices = self._collect_leaf_indices(target_node, k)
+    def subtree_mean_delta(self, node: "KDNode", k: int) -> float:
+        """
+        Mean delta over all training points in `node`'s subtree at interval k.
+        Returns nan if the (node, k) cell is empty. Backed by precomputed
+        per-node arrays — O(1) lookup.
+        """
+        if node.mean_delta is None:
+            raise RuntimeError(
+                "subtree_mean_delta called before mean_delta was populated; "
+                "ensure the forest was built via generate_connected_kdforest_and_paths"
+            )
+        return float(node.mean_delta[k])
 
-        return {
-            "k": k,
-            "node": target_node,
-            "indices": indices,
-        }
+    @staticmethod
+    def tree_path_between(
+        path_A: list, path_B: list
+    ) -> list:
+        """
+        Given the two root→leaf descent paths from `route_with_path` for leaves
+        A and B, return the ordered list of nodes traversing from A → LCA → B.
+
+        The output starts at A and ends at B; LCA appears once in the middle
+        (or at one end if one leaf is an ancestor of the other, though leaves
+        only have leaves as descendants, so this only happens if A == B).
+        """
+        # Longest common prefix (root-down) gives the chain through LCA.
+        lca_idx = 0
+        for a, b in zip(path_A, path_B):
+            if a is b:
+                lca_idx += 1
+            else:
+                break
+        # lca_idx is one past the last common node; the LCA is path_A[lca_idx-1].
+        # Ascending from A to LCA: path_A[-1], path_A[-2], ..., path_A[lca_idx-1]
+        up = list(reversed(path_A[lca_idx - 1:]))
+        # Descending from LCA to B: path_B[lca_idx-1], path_B[lca_idx], ..., path_B[-1]
+        down = path_B[lca_idx:]
+        return up + down
+
+    @staticmethod
+    def assign_middle_nodes(path: list, M: int) -> list:
+        """
+        Pick M nodes (one per middle bin) by depth-interpolation along `path`
+        (which goes A → LCA → B). Endpoints A=path[0] and B=path[-1] are
+        excluded; interior positions are rounded to the nearest node along
+        `path`.
+
+        - D = len(path) - 1 (tree-edge distance from A to B).
+        - For i = 1..M: t_i = round(i * D / (M + 1)); node_i = path[t_i].
+
+        Behavior:
+          - M == D: yields path[1..D] (strict walk between endpoints).
+          - M < D : skips intermediate nodes; lands on shallower ancestors.
+          - M > D : nodes repeat (stall), biased toward the LCA.
+          - len(path) == 1 (A == B): all M assignments equal that single node.
+        """
+        if M <= 0:
+            return []
+        if len(path) == 1:
+            return [path[0]] * M
+        D = len(path) - 1
+        out = []
+        denom = M + 1
+        for i in range(1, M + 1):
+            t = int(round(i * D / denom))
+            t = max(0, min(D, t))
+            out.append(path[t])
+        return out
+
+    @staticmethod
+    def assign_middle_node_weights(path: list, M: int) -> list:
+        """
+        Standard-linear-interpolation analogue of `assign_middle_nodes`.
+
+        For M > 0, return a list of length M; entry i is a 2-tuple of
+        (node, weight) pairs:
+            [(node_lo, w_lo), (node_hi, w_hi)]
+        such that the middle-bin contribution at bin k_mid is
+            w_lo * node_lo.mean_delta[k_mid] + w_hi * node_hi.mean_delta[k_mid].
+
+        Setup: interior = path[1:-1] (endpoints A=path[0], B=path[-1] are
+        excluded), D = len(interior). For i = 1..M:
+            p_i = i * (D - 1) / (M + 1)
+            lo = floor(p_i),  hi = lo + 1   (both clipped to [0, D-1])
+            w_hi = p_i - lo,  w_lo = 1 - w_hi
+
+        Edge cases:
+          - D == 0 (no interior; len(path) in {1, 2}):
+              emit [(path[0], 1.0), (path[0], 0.0)] for every i (fallback to the
+              A endpoint; contributes A's mean_delta[k_mid]).
+          - D == 1: single interior node; emit [(interior[0], 1.0),
+              (interior[0], 0.0)] for every i.
+          - hi == D (clipped to D-1): emit [(interior[lo], 1.0),
+              (interior[lo], 0.0)] (cannot interpolate past the last interior
+              node).
+        """
+        if M <= 0:
+            return []
+        interior = path[1:-1]
+        D = len(interior)
+        if D == 0:
+            anchor = path[0]
+            return [[(anchor, 1.0), (anchor, 0.0)] for _ in range(M)]
+        if D == 1:
+            node = interior[0]
+            return [[(node, 1.0), (node, 0.0)] for _ in range(M)]
+        out = []
+        denom = M + 1
+        for i in range(1, M + 1):
+            p = i * (D - 1) / denom
+            lo = int(p)
+            if lo >= D - 1:
+                # at the upper edge; cannot interpolate past last node
+                out.append([(interior[D - 1], 1.0), (interior[D - 1], 0.0)])
+                continue
+            hi = lo + 1
+            w_hi = p - lo
+            w_lo = 1.0 - w_hi
+            out.append([(interior[lo], w_lo), (interior[hi], w_hi)])
+        return out
 
     def route_and_pick_representative(
         self,
         x_new: np.ndarray,
         X: np.ndarray,
         strategy: str = "first",
-        levels_up: int = 0,
     ) -> Dict[str, object]:
         """
         Route and select a single representative 'actual x' at the leaf.
@@ -179,7 +288,7 @@ class ConnectedKDForest:
           - 'first': pick the first index in that leaf interval
           - 'median_j': pick the index whose X_j is median within the leaf interval
         """
-        info = self.route(x_new, levels_up=levels_up)
+        info = self.route(x_new)
         idxs = info["indices"]
         if idxs.size == 0:
             raise RuntimeError("Leaf is unexpectedly empty for interval k")
@@ -198,6 +307,137 @@ class ConnectedKDForest:
             "representative_index": chosen_idx,
             "representative_x": X[chosen_idx].copy(),
         }
+
+    # ------------------------------------------------------------------
+    # Pretty printing
+    # ------------------------------------------------------------------
+    def __repr__(self) -> str:
+        depth, n_leaves, n_internal = self._tree_stats()
+        return (
+            f"ConnectedKDForest(feature_idx={self.feature_idx}, K={self.K}, "
+            f"depth={depth}, internal_nodes={n_internal}, leaves={n_leaves})"
+        )
+
+    def _tree_stats(self) -> tuple:
+        if self.root is None:
+            return 0, 0, 0
+        max_depth = 0
+        n_leaves = 0
+        n_internal = 0
+        stack = [(self.root, 0)]
+        while stack:
+            node, d = stack.pop()
+            max_depth = max(max_depth, d)
+            if node.is_leaf:
+                n_leaves += 1
+            else:
+                n_internal += 1
+                stack.append((node.left, d + 1))
+                stack.append((node.right, d + 1))
+        return max_depth, n_leaves, n_internal
+
+    def pretty_print(
+        self,
+        max_depth: Optional[int] = None,
+        show_thresholds: bool = True,
+        show_stats: bool = True,
+        show_indices: bool = True,
+        max_indices_shown: int = 12,
+        feature_names: Optional[list] = None,
+        float_fmt: str = "{:.3f}",
+        max_bins_shown: int = 6,
+    ) -> str:
+        """
+        Render the forest as a text tree. Returns the string (also printable).
+
+        Parameters
+        ----------
+        max_depth        : if set, truncate the tree below this depth.
+        show_thresholds  : show per-bin split thresholds at internal nodes.
+        show_stats       : show per-bin n / mean_delta at leaves.
+        feature_names    : optional names; falls back to "x{m}".
+        float_fmt        : format spec for floats.
+        max_bins_shown   : truncate per-bin arrays after this many entries.
+        """
+        if self.root is None:
+            text = f"{self!r}\n(empty — forest not built)"
+            print(text)
+            return text
+
+        def name(m: int) -> str:
+            if feature_names is not None and 0 <= m < len(feature_names):
+                return feature_names[m]
+            return f"x{m}"
+
+        def fmt_array(arr) -> str:
+            if arr is None:
+                return "?"
+            vals = list(arr)
+            trunc = len(vals) > max_bins_shown
+            shown = vals[:max_bins_shown]
+            parts = []
+            for v in shown:
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    parts.append("nan")
+                else:
+                    try:
+                        parts.append(float_fmt.format(float(v)))
+                    except (TypeError, ValueError):
+                        parts.append(str(v))
+            s = "[" + ", ".join(parts) + ("…" if trunc else "") + "]"
+            return s
+
+        lines = [repr(self)]
+
+        def recurse(node: KDNode, prefix: str, is_last: bool, depth: int):
+            connector = "└── " if is_last else "├── "
+            if node.is_leaf:
+                bits = [f"leaf (depth={depth})"]
+                if show_stats:
+                    if node.n_per_bin is not None:
+                        bits.append(f"n_per_bin={fmt_array(node.n_per_bin)}")
+                    if node.mean_delta is not None:
+                        bits.append(f"mean_delta={fmt_array(node.mean_delta)}")
+                    if node.n_per_bin is None and node.R is not None:
+                        counts = [len(r) for r in node.R]
+                        bits.append(f"n_per_bin={fmt_array(counts)}")
+                lines.append(prefix + connector + "  ".join(bits))
+                if show_indices and node.R is not None:
+                    child_prefix = prefix + ("    " if is_last else "│   ")
+                    n_bins = len(node.R)
+                    bins_to_show = min(n_bins, max_bins_shown)
+                    for k in range(bins_to_show):
+                        idxs = list(node.R[k])
+                        trunc_idx = len(idxs) > max_indices_shown
+                        shown = idxs[:max_indices_shown]
+                        idx_str = ", ".join(str(int(i)) for i in shown)
+                        if trunc_idx:
+                            idx_str += f", … (+{len(idxs) - max_indices_shown})"
+                        lines.append(f"{child_prefix}  R[{k}] = [{idx_str}]")
+                    if n_bins > bins_to_show:
+                        lines.append(
+                            f"{child_prefix}  … ({n_bins - bins_to_show} more bins)"
+                        )
+                return
+
+            head = f"split on {name(node.split_feature)} (depth={depth})"
+            if show_thresholds and node.thresholds is not None:
+                head += f"  thr={fmt_array(node.thresholds)}"
+            lines.append(prefix + connector + head)
+
+            if max_depth is not None and depth >= max_depth:
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                lines.append(child_prefix + "└── … (truncated)")
+                return
+
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            recurse(node.left, child_prefix, is_last=False, depth=depth + 1)
+            recurse(node.right, child_prefix, is_last=True, depth=depth + 1)
+
+        recurse(self.root, prefix="", is_last=True, depth=0)
+        text = "\n".join(lines)
+        print(text)
+        return text
 
 
 ###
@@ -360,7 +600,7 @@ def _split_leaf(
 
 def generate_connected_kdforest_and_paths(
     X: np.ndarray,
-    feature_idx: int,
+    j: int,
     edges: np.ndarray,
     deltas: np.ndarray,
     categorical: list,
@@ -370,7 +610,7 @@ def generate_connected_kdforest_and_paths(
     """
     Parameters:
     - X: (n, d) data
-    - feature_idx: 1-based index of the feature to split on (j)
+    - j: 0-based index of the feature to split on
     - edges: edges for feature j
     - deltas: (n,) array of finite differences for feature j
     - categorical: list of booleans indicating if each feature is categorical
@@ -379,8 +619,6 @@ def generate_connected_kdforest_and_paths(
     - forest: ConnectedKDForest
     - paths: list of length L, each element is a length-K numpy array of index arrays
     """
-    # Convert to 0-based j
-    j = feature_idx - 1
     xj = X[:, j]
     k_x, _ = calculate_bins(xj, edges, categorical=categorical[j])
 
@@ -403,7 +641,10 @@ def generate_connected_kdforest_and_paths(
             f"generate_connected_kdforest_and_paths: empty intervals found at root: {empty_intervals}"
         )
 
-    root = KDNode(split_feature=None, thresholds=None, left=None, right=None, R=root_R)
+    root = KDNode(
+        split_feature=None, thresholds=None, left=None, right=None,
+        parent=None, R=root_R,
+    )
 
     # create priority queue
     queue = PriorityQueue()
@@ -425,10 +666,12 @@ def generate_connected_kdforest_and_paths(
 
         # Build children nodes
         left = KDNode(
-            split_feature=None, thresholds=None, left=None, right=None, R=R_left
+            split_feature=None, thresholds=None, left=None, right=None,
+            parent=node, R=R_left,
         )
         right = KDNode(
-            split_feature=None, thresholds=None, left=None, right=None, R=R_right
+            split_feature=None, thresholds=None, left=None, right=None,
+            parent=node, R=R_right,
         )
 
         # Convert current node to internal split node
@@ -462,4 +705,102 @@ def generate_connected_kdforest_and_paths(
         path = [np.array(interval, dtype=int) for interval in node.R]
         paths.append(path)
 
+    # Precompute per-node, per-bin subtree mean deltas and counts via post-order
+    # traversal. Used by the `multi_path` local explanation method. Cost is
+    # O(|nodes| * K), amortized once per feature.
+    _populate_subtree_stats(root, deltas, K)
+
     return forest, paths
+
+
+def iter_subtree_indices_at_bin(node: "KDNode", k: int) -> np.ndarray:
+    """
+    Return the observation indices contributing to `node.mean_delta[k]`,
+    matching the post-order recursion in `_populate_subtree_stats`. The
+    returned array has length `node.n_per_bin[k]` and may contain repeats:
+    `_split_leaf`'s tie-break can move one half of a singleton-duplicated
+    observation to the empty-side child, so the same obs appears at bin k
+    in both children's subtrees. mean_delta count-weights those repeats
+    (giving the duplicated obs a higher weight in the parent's mean), so
+    downstream weight distribution must respect them.
+
+    Consumers should use `np.add.at(out, idx, coef / n_per_bin[k])` so that
+    duplicate indices accumulate correctly.
+
+    At the leaf level we still dedup R[k] via `np.unique`, mirroring
+    `_populate_subtree_stats`'s leaf-level handling of intra-leaf duplicates
+    introduced by `_perform_duplication`.
+    """
+    if node.is_leaf:
+        if not node.R[k]:
+            return np.empty(0, dtype=int)
+        return np.unique(np.asarray(node.R[k], dtype=int))
+    left = iter_subtree_indices_at_bin(node.left, k)
+    right = iter_subtree_indices_at_bin(node.right, k)
+    if left.size == 0:
+        return right
+    if right.size == 0:
+        return left
+    return np.concatenate([left, right])
+
+
+def _populate_subtree_stats(node: "KDNode", deltas: np.ndarray, K: int) -> None:
+    """
+    Post-order fill of node.mean_delta (shape K) and node.n_per_bin (shape K)
+    for every node in the subtree rooted at `node`.
+
+    Invariant (per node, per bin k):
+        node.mean_delta[k] = (mL*nL + mR*nR) / (nL + nR)            (children avg)
+        node.n_per_bin[k] = sum of children's n_per_bin[k]           (sum count)
+
+    At leaves both reduce to `mean / count of unique obs in R[k]` (since
+    `_perform_duplication` may replicate singletons inside a leaf, and those
+    duplicates share a delta value, so deduping via `np.unique` does not
+    change the mean and makes the leaf's n_per_bin a true unique count).
+
+    Beware that at INTERNAL nodes `n_per_bin[k]` is NOT always a unique count:
+    `_split_leaf`'s tie-break may move one of a singleton-duplicated obs into
+    the empty-side child, leaving the same obs in both children's subtrees at
+    bin k. The recursion then counts that obs once per child, and `mean_delta`
+    weights its delta by 2 rather than 1. This is the correct invariant for
+    the multi_path estimator (each leaf occurrence is one "vote"), and the
+    weight-distribution path uses the same multiplicities.
+    """
+    if node.is_leaf:
+        mean_d = np.full(K, np.nan, dtype=float)
+        n_per = np.zeros(K, dtype=int)
+        for k in range(K):
+            idx_k = node.R[k]
+            if not idx_k:
+                continue
+            arr = np.asarray(idx_k, dtype=int)
+            # _perform_duplication may have duplicated singleton entries; since
+            # duplicates share the same delta the mean is unaffected, and we
+            # report a count of unique observations for downstream weighting.
+            unique = np.unique(arr)
+            n_per[k] = int(unique.size)
+            mean_d[k] = float(deltas[unique].mean())
+        node.mean_delta = mean_d
+        node.n_per_bin = n_per
+        return
+
+    _populate_subtree_stats(node.left, deltas, K)
+    _populate_subtree_stats(node.right, deltas, K)
+
+    nL = node.left.n_per_bin
+    nR = node.right.n_per_bin
+    mL = node.left.mean_delta
+    mR = node.right.mean_delta
+
+    n_per = nL + nR
+    mean_d = np.full(K, np.nan, dtype=float)
+    for k in range(K):
+        total = n_per[k]
+        if total == 0:
+            continue
+        sL = (mL[k] * nL[k]) if nL[k] > 0 else 0.0
+        sR = (mR[k] * nR[k]) if nR[k] > 0 else 0.0
+        mean_d[k] = (sL + sR) / total
+
+    node.mean_delta = mean_d
+    node.n_per_bin = n_per

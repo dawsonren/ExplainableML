@@ -71,18 +71,31 @@ def calculate_bins_2d(
     return k_x, m_x, N_k, N_m, N_km
 
 
-def calculate_deltas(f, X, idx, edges, k_x):
-    # use vectorization while evaluating f
+def calculate_deltas(f, X, idx, edges, k_x, categorical=False):
+    """
+    Per-observation finite difference f(x_right) - f(x_left) along feature `idx`.
+
+    Continuous (right-difference): bin k uses x_left=edges[k], x_right=edges[k+1],
+    so bin k's mean delta accumulates into the cumulative ALE from edges[k] to
+    edges[k+1].
+
+    Categorical (left-difference): bin k corresponds to category edges[k]. For
+    k >= 1, x_left=edges[k-1], x_right=edges[k] (effect of moving from the
+    previous category to this one). Bin 0 has no predecessor and contributes 0,
+    anchoring the cumulative ALE at the first category.
+    """
     X_left = X.copy()
     X_right = X.copy()
     n = X.shape[0]
     for i in range(n):
-        # NOTE: skips observations in the final categorical bin since it
-        # has no right edge (categorical bins correspond to unique values).
-        if k_x[i] >= len(edges) - 1:
-            continue
-        X_left[i, idx] = edges[k_x[i]]
-        X_right[i, idx] = edges[k_x[i] + 1]
+        if categorical:
+            if k_x[i] == 0:
+                continue
+            X_left[i, idx] = edges[k_x[i] - 1]
+            X_right[i, idx] = edges[k_x[i]]
+        else:
+            X_left[i, idx] = edges[k_x[i]]
+            X_right[i, idx] = edges[k_x[i] + 1]
     deltas = f(X_right) - f(X_left)
     return deltas
 

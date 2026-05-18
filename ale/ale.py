@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 from ale.ale_plot import _ale_1d, _ale_2d
 from ale.shared import calculate_edges, calculate_K, relabel_categorical_features
-from ale.ale_vim import (
+from ale.vim import (
     _ale_main_vim,
     _ale_total_vim,
     _ale_local_vim,
@@ -28,7 +28,6 @@ class ALE(Explanation):
         verbose=True,
         interpolate=True,
         centering="x",
-        knn_smooth=None,
         edges=None,
         random_seed=42,
     ):
@@ -45,12 +44,11 @@ class ALE(Explanation):
         - verbose: whether to print verbose output.
         - interpolate: whether to interpolate the ALE values.
         - centering: how to center the ALE values.
-        - knn_smooth: if set, smooth deltas within each bin using KNN averaging.
-        - edges: optional dict mapping 1-indexed feature index to edges array.
+        - edges: optional dict mapping 0-indexed feature index to edges array.
                  Features not in the dict will have edges calculated as usual.
         - random_seed: seed used by method='random' path generation. Per-feature
-                 seed is derived as random_seed + feature_idx so different
-                 features get different random partitions but are reproducible.
+                 seed is derived as random_seed + j so different features get
+                 different random partitions but are reproducible.
         """
         super().__init__(f, X, feature_names, categorical, log_queries=False)
 
@@ -68,7 +66,6 @@ class ALE(Explanation):
         self.verbose = verbose
         self.interpolate = interpolate
         self.centering = centering
-        self.knn_smooth = knn_smooth
         self.random_seed = random_seed
         # wrap f to handle categorical feature conversion
         self.original_f = f
@@ -84,8 +81,8 @@ class ALE(Explanation):
         self.edges = {}
         edges = edges or {}
         for j in range(self.d):
-            if (j + 1) in edges:
-                self.edges[j] = edges[j + 1]
+            if j in edges:
+                self.edges[j] = edges[j]
             else:
                 self.edges[j] = calculate_edges(
                     self.X_values[:, j], self.K, self.categorical[j]
@@ -155,32 +152,32 @@ class ALE(Explanation):
 
     def _get_feature_index(self, feature):
         """
-        Get the 0-based index of a feature given its 1-based index or name.
+        Get the 0-based index of a feature given its 0-based index or name.
         """
         if isinstance(feature, int):
-            idx = feature - 1
+            idx = feature
         else:
             idx = self.feature_names.index(feature)
 
         if idx < 0 or idx >= self.d:
             raise ValueError(
-                "Feature index out of bounds, must be between 1 and d inclusive."
+                f"Feature index {idx} out of bounds; must be in [0, {self.d})."
             )
         return idx
 
     def ale_1d(self, feature):
         """
-        Plot the 1D ALE for a given feature index (1-based).
+        Plot the 1D ALE for a given feature index (0-based).
 
         Parameters:
-        - feature: 1-based index or feature name.
+        - feature: 0-based index or feature name.
         """
         idx = self._get_feature_index(feature)
 
         edges, curve = _ale_1d(
             self.f,
             self.X_values,
-            idx + 1,
+            idx,
             bins=self.K,
             categorical=self.categorical[idx],
         )
@@ -220,11 +217,11 @@ class ALE(Explanation):
 
     def ale_2d(self, feature_1, feature_2):
         """
-        Plot the 2D ALE for a pair of feature indices (1-based).
+        Plot the 2D ALE for a pair of feature indices (0-based).
 
         Parameters:
-        - feature_1: 1-based index or feature name of the first feature.
-        - feature_2: 1-based index or feature name of the second feature.
+        - feature_1: 0-based index or feature name of the first feature.
+        - feature_2: 0-based index or feature name of the second feature.
         """
         idx_1 = self._get_feature_index(feature_1)
         idx_2 = self._get_feature_index(feature_2)
@@ -234,8 +231,8 @@ class ALE(Explanation):
         edges1_interaction, edges2_interaction, curve_interaction = _ale_2d(
             self.f,
             self.X_values,
-            idx_1 + 1,
-            idx_2 + 1,
+            idx_1,
+            idx_2,
             bins=self.K,
             categorical_1=self.categorical[idx_1],
             categorical_2=self.categorical[idx_2],
@@ -343,10 +340,10 @@ class ALE(Explanation):
 
     def ale_main_vim(self, feature):
         """
-        Calculate the main effect variable importance measure (VIM) for a given feature index (1-based).
+        Calculate the main effect variable importance measure (VIM) for a given feature index (0-based).
 
         Parameters:
-        - feature: 1-based index or feature name.
+        - feature: 0-based index or feature name.
 
         Returns:
         - The main effect VIM value.
@@ -356,7 +353,7 @@ class ALE(Explanation):
         return _ale_main_vim(
             self.f,
             self.X_values,
-            idx + 1,
+            idx,
             edges=self.edges[idx],
             categorical=self.categorical[idx],
             interpolate=self.interpolate and not self.categorical[idx],
@@ -365,10 +362,10 @@ class ALE(Explanation):
 
     def ale_total_vim(self, feature, method="connected"):
         """
-        Calculate the total ALE VIM for a given feature index (1-based).
+        Calculate the total ALE VIM for a given feature index (0-based).
 
         Parameters:
-        - feature: 1-based index or feature name.
+        - feature: 0-based index or feature name.
         - method: "connected", "quantile", or "random" for path generation.
 
         Returns:
@@ -395,7 +392,7 @@ class ALE(Explanation):
         ) = _ale_total_vim(
             self.f,
             self.X_values,
-            idx + 1,
+            idx,
             self.K,
             self.L,
             self.categorical,
@@ -404,7 +401,6 @@ class ALE(Explanation):
             interpolate=self.interpolate and not self.categorical[idx],
             centering=self.centering,
             edges=self.edges[idx],
-            knn_smooth=self.knn_smooth,
             seed=seed,
         )
         # store the generated paths for potential reuse. Both connected and
@@ -443,23 +439,23 @@ class ALE(Explanation):
         for i in range(self.d):
             if self.verbose:
                 print(
-                    f"Calculating explanations for feature {i + 1} ({self.feature_names[i]})"
+                    f"Calculating explanations for feature {i} ({self.feature_names[i]})"
                 )
             explanation_i = {}
 
             if "main" in include:
-                explanation_i["main"] = np.sqrt(self.ale_main_vim(i + 1))
+                explanation_i["main"] = np.sqrt(self.ale_main_vim(i))
             if "total_quantile" in include:
                 explanation_i["total_quantile"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="quantile")
+                    self.ale_total_vim(i, method="quantile")
                 )
             if "total_connected" in include:
                 explanation_i["total_connected"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="connected")
+                    self.ale_total_vim(i, method="connected")
                 )
             if "total_random" in include:
                 explanation_i["total_random"] = np.sqrt(
-                    self.ale_total_vim(i + 1, method="random")
+                    self.ale_total_vim(i, method="random")
                 )
 
             explanations[self.feature_names[i]] = explanation_i
@@ -467,6 +463,70 @@ class ALE(Explanation):
         df = pd.DataFrame(explanations)
         df.set_index(pd.Index(include), inplace=True)
         return df
+
+    def check_main_total_invariant(
+        self, explanation=None, tol: float = 1e-6, verbose: bool = True
+    ) -> bool:
+        """
+        Verify the theoretical invariant `main <= total_*` per feature.
+
+        The main-effect ALE is a single-feature projection while the total-effect
+        ALE collects all interactions involving that feature, so by construction
+        main <= total in any decomposition. If this fails, the partition / path
+        approximation is biasing the total downward (or the main upward).
+
+        Parameters
+        ----------
+        explanation : optional pre-computed DataFrame from `.explain()`. If
+                      omitted, runs explain() with defaults.
+        tol         : numerical slack — violations within tol are ignored.
+        verbose     : print per-feature violations.
+
+        Returns True iff no violation exceeds tol.
+        """
+        if explanation is None:
+            explanation = self.explain()
+        if "main" not in explanation.index:
+            raise ValueError("explanation must include the 'main' row")
+        total_rows = [r for r in explanation.index if r.startswith("total_")]
+        if not total_rows:
+            raise ValueError("explanation must include at least one 'total_*' row")
+
+        main_row = explanation.loc["main"]
+        ok = True
+        for col in explanation.columns:
+            main_val = float(main_row[col])
+            for total_name in total_rows:
+                total_val = float(explanation.loc[total_name, col])
+                diff = main_val - total_val
+                if diff > tol:
+                    ok = False
+                    if verbose:
+                        print(
+                            f"  [VIOLATION] feature={col!r}: main={main_val:.6f} > "
+                            f"{total_name}={total_val:.6f}  (excess={diff:.6f})"
+                        )
+        if ok and verbose:
+            print("  [OK] main <= total_* holds for every feature.")
+        return ok
+
+    def print_forest(self, feature, **kwargs) -> str:
+        """
+        Pretty-print the ConnectedKDForest for a feature. Requires that
+        `ale_total_vim(feature, method='connected')` has been called (e.g. via
+        `.explain()` with `total_connected` included).
+
+        Extra kwargs are forwarded to `ConnectedKDForest.pretty_print`
+        (e.g. max_depth, show_thresholds, show_stats, max_bins_shown).
+        """
+        idx = self._get_feature_index(feature)
+        if idx not in self.connected_forest:
+            raise ValueError(
+                f"No connected forest stored for feature {feature!r}. "
+                "Call ale_total_vim(..., method='connected') or .explain() first."
+            )
+        kwargs.setdefault("feature_names", list(self.feature_names))
+        return self.connected_forest[idx].pretty_print(**kwargs)
 
     def _prepare_explain(self, X_explain):
         """Convert and validate X_explain for local explanation methods."""
@@ -477,7 +537,7 @@ class ALE(Explanation):
         for j in range(self.d):
             if j not in self.connected_paths or j not in self.connected_forest:
                 raise ValueError(
-                    f"Connected paths/forest for feature index {j + 1} not found. "
+                    f"Connected paths/forest for feature index {j} not found. "
                     "Please run ale_total_vim with method='connected' first."
                 )
         return X_explain
@@ -492,8 +552,7 @@ class ALE(Explanation):
     def explain_local(
         self,
         X_explain,
-        levels_up=0,
-        local_method="interpolate",
+        local_method="path_rep",
         background_size=None,
         background_seed=None,
         boundary_interp=False,
@@ -504,29 +563,33 @@ class ALE(Explanation):
 
         Parameters:
         - X_explain: Points to explain (n_explain, d) or (d,).
-        - levels_up: Number of levels to go up in the tree for smoothing.
-                     0 = exact leaf, higher = average over more paths.
         - local_method: How to compute the within-bin term added to g*(x_j_left):
-            - "interpolate" (default): alpha * Delta_{k,l} via linear
-              interpolation of the centered g-value curve (no extra f calls).
-            - "path_rep": mean over path members in (path l, bin k) of
-              [f(x_j, x*_\\j) - f(x_j_left, x*_\\j)]. Costs extra f evals.
-              Raises ValueError if the (path, bin) cell is empty.
-            - "self": [f(x_j, x_\\j) - f(x_j_left, x_\\j)] using the explain
-              point's own off-feature values. Costs extra f evals.
-          For categorical features, local_method is ignored and piecewise
-          lookup is used.
+            - "path_rep" (default): mean over path members in (path l, bin k)
+              of [f(x_j, x*_\\j) - f(x_j_left, x*_\\j)]. Costs extra f evals.
+              Raises ValueError if the (path, bin) cell is empty. For
+              categorical features the centered g-value curve is looked up
+              directly (fresh forward-differences are ill-defined there).
             - "path_integral": for each background x in self.X_values, walk
               through ALE bins from x_j to x*_j, accumulating partial-bin
               f-differences at the endpoints and pre-computed deltas at
               interpolated middle bins (off-j coords linearly interpolated,
               routed to the nearest training index via the forest). Returns
               the mean over the background. Does not use g_values.
-        - background_size: only used by local_method='path_integral'. If set
-          and < n, average over a random subsample of size background_size of
-          self.X_values rather than the full training set. Reduces cost
-          linearly in this size. Forest, deltas, and f(X) cache are still
-          built/computed on the full training set.
+            - "multi_path_interpolate": structure-aware path integral. Routes
+              x and x* into the connected KD-forest at their respective bins
+              to get leaves A and B, then traverses the tree path A → LCA → B
+              via depth-interpolation. Each middle bin mixes two adjacent
+              interior-path nodes via standard linear interpolation
+              (positions p_i = i*(D-1)/(M+1)). Boundary terms reuse
+              path_integral's alpha-scaling, with the delta source swapped to
+              the relevant leaf's per-bin mean delta. Never calls f during
+              explain_local. Does not use g_values.
+        - background_size: only used by local_method in {'path_integral',
+          'multi_path_interpolate'}. If set and < n, average over a random
+          subsample of size background_size of self.X_values rather than the
+          full training set. Reduces cost linearly in this size. Forest,
+          deltas, and f(X) cache are still built/computed on the full
+          training set.
         - background_seed: RNG seed for the background subsample. Defaults to
           self.random_seed.
         - boundary_interp: only used by local_method='path_integral'. If True,
@@ -536,20 +599,21 @@ class ALE(Explanation):
           explain_local at the cost of some accuracy. Recommended when f is
           expensive (NNs, RFs).
         """
-        if local_method not in ("interpolate", "path_rep", "self", "path_integral"):
+        if local_method not in ("path_rep", "path_integral", "multi_path_interpolate"):
             raise ValueError(
                 f"Unknown local_method {local_method!r}; must be one of "
-                "'interpolate', 'path_rep', 'self', 'path_integral'."
+                "'path_rep', 'path_integral', 'multi_path_interpolate'."
             )
         X_explain = self._prepare_explain(X_explain)
 
-        # path_integral-only: pre-compute f(X) cache and background subsample
+        # path_integral / multi_path_interpolate: pre-compute f(X) cache
+        # (path_integral only, and only when boundary_interp=False) and the
+        # background subsample (shared by both).
         f_X = None
         background_indices = None
-        if local_method == "path_integral":
-            # f(X) cache is only useful when boundary_interp=False (it's only
-            # consumed by the f-eval boundary mode); skip the eval otherwise.
-            if not boundary_interp:
+        if local_method in ("path_integral", "multi_path_interpolate"):
+            if local_method == "path_integral" and not boundary_interp:
+                # f(X) cache only useful in the f-eval boundary mode.
                 f_X = self._get_f_X()
             if background_size is not None and background_size < self.n:
                 seed = self.random_seed if background_seed is None else background_seed
@@ -562,17 +626,16 @@ class ALE(Explanation):
         for j in range(self.d):
             if self.verbose:
                 print(
-                    f"Generating local explanation for feature {j + 1} ({self.feature_names[j]})"
+                    f"Generating local explanation for feature {j} ({self.feature_names[j]})"
                 )
             explanations[:, j] = _ale_local_vim(
                 self.X_values,
-                j + 1,
+                j,
                 X_explain,
                 self.centered_g_values[j],
                 self.categorical,
                 self.observation_to_path[j],
                 forest=self.connected_forest[j],
-                levels_up=levels_up,
                 edges=self.edges[j],
                 f=self.f,
                 k_x=self.k_x[j],
@@ -585,217 +648,80 @@ class ALE(Explanation):
 
         return explanations
 
-    def explain_global(self, levels_up=0, local_method="interpolate"):
+    def explain_local_weights(
+        self, X_explain, local_method="multi_path_interpolate",
+        background_size=None, background_seed=None,
+    ):
+        """
+        Return per-observation linear weights for the local explanation.
+
+        For local_method='multi_path_interpolate' the estimator is linear in
+        the training deltas. This method returns
+
+            W of shape (n_explain, d, n_train)
+
+        such that for every feature j:
+            explain_local(X_explain, local_method='multi_path_interpolate')[i, j]
+            == W[i, j] @ self.deltas[j]
+
+        Each `coef * node.mean_delta[k]` term in the estimator distributes
+        `coef / node.n_per_bin[k]` across the unique observations in that
+        node's subtree at bin k.
+
+        Notes:
+        - Computed on demand; can be expensive for large n_train (memory is
+          O(n_explain · d · n_train)).
+        - If a `background_size` is provided, observations outside the bg
+          subsample get weight 0 (they were never routed).
+        - Other local_method values are not linear in deltas in the same way
+          and raise ValueError.
+        """
+        from ale.vim import _ale_local_vim_multi_path
+
+        if local_method != "multi_path_interpolate":
+            raise ValueError(
+                "explain_local_weights only supports 'multi_path_interpolate'; "
+                f"got {local_method!r}."
+            )
+        X_explain = self._prepare_explain(X_explain)
+
+        background_indices = None
+        if background_size is not None and background_size < self.n:
+            seed = self.random_seed if background_seed is None else background_seed
+            rng = np.random.default_rng(seed)
+            background_indices = rng.choice(
+                self.n, size=int(background_size), replace=False
+            )
+
+        n_explain = X_explain.shape[0]
+        W = np.zeros((n_explain, self.d, self.n), dtype=float)
+        for j in range(self.d):
+            if self.verbose:
+                print(
+                    f"Generating local-weight explanation for feature {j} ({self.feature_names[j]})"
+                )
+            W[:, j, :] = _ale_local_vim_multi_path(
+                self.X_values,
+                j,
+                X_explain,
+                self.deltas[j],
+                self.edges[j],
+                self.categorical,
+                self.connected_forest[j],
+                self.k_x[j],
+                background_indices=background_indices,
+                return_weights=True,
+            )
+        return W
+
+    def explain_global(self, local_method="path_rep"):
         """
         The global effect is the sample variance of the local effects across all X values.
         """
         local_explanations = self.explain_local(
-            self.X_values, levels_up=levels_up, local_method=local_method
+            self.X_values, local_method=local_method
         )
         return np.var(local_explanations, axis=0)
-
-    def plot_connected_paths(self, feature_1, feature_2):
-        """
-        Plot the connected paths for a pair of feature indices (1-based).
-
-        Parameters:
-        - feature_1: 1-based index or feature name of the examined feature.
-        - feature_2: 1-based index or feature name of the secondary feature (plotted on y axis)
-        """
-        idx_1 = self._get_feature_index(feature_1)
-        idx_2 = self._get_feature_index(feature_2)
-        if idx_1 == idx_2:
-            raise ValueError(
-                "Feature indices must be different for connected paths plot."
-            )
-
-        if idx_1 not in self.connected_paths or idx_2 not in self.connected_paths:
-            raise ValueError(
-                f"Connected paths for feature indices {idx_1 + 1} and/or {idx_2 + 1} not found. Please run ale_total_vim with method='connected' first."
-            )
-
-        paths = self.connected_paths[idx_1]
-        if not paths:
-            raise ValueError(
-                f"No connected path found between features {idx_1 + 1} and {idx_2 + 1}."
-            )
-
-        categorical_1 = self.categorical[idx_1]
-        edges_1 = self.edges[idx_1]
-
-        if not categorical_1:
-            for e in edges_1:
-                plt.axvline(x=e, color="black", linestyle="--", alpha=0.4)
-
-        X = self.X_values
-        # show the connected paths
-        plt.scatter(X[:, idx_1], X[:, idx_2], alpha=0.3)
-        for path in paths:
-            # technically the averaging happens within intervals, but this is fine
-            flat_path = [item for interval in path for item in interval]
-            plt.plot(X[flat_path, idx_1], X[flat_path, idx_2])
-
-        plt.xlabel(f"{self.feature_names[idx_1]}")
-        plt.ylabel(f"{self.feature_names[idx_2]}")
-        plt.title(f"Connected Paths for {self.feature_names[idx_1]}")
-
-    def plot_ale_ice(self, feature):
-        idx = self._get_feature_index(feature)
-        categorical = self.categorical[idx]
-
-        # check if connected paths and g_values exist
-        if idx not in self.connected_paths or idx not in self.connected_forest:
-            raise ValueError(
-                f"Connected paths/forest for feature index {idx + 1} not found. Please run ale_total_vim with method='connected' first."
-            )
-
-        # get centered g_values
-        y_axis = self.centered_g_values[idx].centered_g_values
-        edges = self.edges[idx]
-        # plot versus feature edges
-        for l in range(y_axis.shape[1]):
-            # if categorical, plot as bar chart
-            if categorical:
-                # map back to original category labels
-                original_edges = [self.num_to_label[idx][int(e)] for e in edges]
-                plt.bar(
-                    original_edges, y_axis[:, l], width=0.5, align="center", alpha=0.7
-                )
-                # draw horizontal line at y=0
-                plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-            else:
-                # plot
-                plt.plot(edges, y_axis[:, l], color="blue", alpha=0.8)
-        plt.xlabel(f"{self.feature_names[idx]}")
-        plt.ylabel("Centered g-values")
-        plt.title(f"Centered g-values for {self.feature_names[idx]}")
-        # plot horizontal lines at edges
-        if not categorical:
-            for e in edges:
-                plt.axvline(x=e, color="black", linestyle="--", alpha=0.4)
-
-    def plot_paths_summary(self, feature_1, feature_2, figsize=(21, 5), cmap="tab10"):
-        """
-        Combined three-subplot visualization linking data partitions to g-value curves.
-
-        Left subplot — scatter of (feature_1, feature_2) with each path's observations
-        colored uniquely. Bin centroid trajectories are drawn as thin lines.
-
-        Middle subplot — heatmap of f evaluated across the grid of feature_1 and feature_2,
-        with the same path centroids overlaid.
-
-        Right subplot — centered g-value curve for each path vs feature_1 edges,
-        using the same per-path colors as the left subplot.
-
-        Parameters
-        ----------
-        feature_1 : int or str
-            Feature whose ALE paths / g-value curves are shown (x-axis in all subplots).
-        feature_2 : int or str
-            Feature shown on the y-axis of the left scatter subplot.
-        figsize : tuple, default (21, 5)
-        cmap : str, default "tab10"
-            Matplotlib colormap name. Should have at least L distinct colors.
-
-        Returns
-        -------
-        fig, (ax_data, ax_heatmap, ax_effect)
-        """
-        idx_1 = self._get_feature_index(feature_1)
-        idx_2 = self._get_feature_index(feature_2)
-
-        if idx_1 == idx_2:
-            raise ValueError("feature_1 and feature_2 must be different.")
-        if idx_1 not in self.connected_paths:
-            raise ValueError(
-                f"Connected paths for feature {idx_1 + 1} not found. "
-                "Run ale_total_vim(method='connected') first."
-            )
-
-        paths = self.connected_paths[idx_1]
-        edges = self.edges[idx_1]
-        g_vals = self.centered_g_values[idx_1].centered_g_values  # (K+1, L) or (K, L)
-        L = g_vals.shape[1]
-
-        cmap_obj = plt.get_cmap(cmap)
-        colors = [cmap_obj(l / max(L - 1, 1)) for l in range(L)]
-
-        fig, (ax_data, ax_heatmap, ax_effect) = plt.subplots(1, 3, figsize=figsize)
-
-        # --- Left: scatter + path intervals ---
-        ax_data.scatter(
-            self.X_values[:, idx_1], self.X_values[:, idx_2],
-            color="lightgray", alpha=0.3, s=5, zorder=1,
-        )
-        for l, path in enumerate(paths):
-            c = colors[l]
-            centroids_x, centroids_y = [], []
-            for k, interval in enumerate(path):
-                if len(interval) > 0:
-                    pts = self.X_values[interval]
-                    # double check that all points are within the bin edges
-                    assert np.all(pts[:, idx_1] >= edges[k]) and np.all(pts[:, idx_1] <= edges[k + 1]), "Points are not within bin edges"
-                    ax_data.scatter(
-                        pts[:, idx_1], pts[:, idx_2],
-                        color=c, alpha=0.6, s=10, zorder=2,
-                    )
-                    centroids_x.append(pts[:, idx_1].mean())
-                    centroids_y.append(pts[:, idx_2].mean())
-            if centroids_x:
-                ax_data.plot(centroids_x, centroids_y, color=c, alpha=0.5, linewidth=1)
-                ax_heatmap.plot(centroids_x, centroids_y, color=c, alpha=0.8, linewidth=2, marker='o', markersize=3)
-        for e in edges:
-            ax_data.axvline(e, color="black", linestyle="--", alpha=0.3)
-        ax_data.set_xlabel(self.feature_names[idx_1])
-        ax_data.set_ylabel(self.feature_names[idx_2])
-        ax_data.set_title(
-            f"Paths: {self.feature_names[idx_1]} vs {self.feature_names[idx_2]}"
-        )
-
-        # --- Middle: Heatmap of f ---
-        grid_size = 50
-        x1_min, x1_max = self.X_values[:, idx_1].min(), self.X_values[:, idx_1].max()
-        x2_min, x2_max = self.X_values[:, idx_2].min(), self.X_values[:, idx_2].max()
-        x1_grid = np.linspace(x1_min, x1_max, grid_size)
-        x2_grid = np.linspace(x2_min, x2_max, grid_size)
-        xx1, xx2 = np.meshgrid(x1_grid, x2_grid)
-
-        X_grid = np.zeros((grid_size * grid_size, self.d))
-        for j in range(self.d):
-            if self.categorical[j]:
-                vals, counts = np.unique(self.X_values[:, j], return_counts=True)
-                X_grid[:, j] = vals[np.argmax(counts)]
-            else:
-                X_grid[:, j] = self.X_values[:, j].mean()
-        
-        X_grid[:, idx_1] = xx1.ravel()
-        X_grid[:, idx_2] = xx2.ravel()
-        
-        z = self.f(X_grid).reshape(grid_size, grid_size)
-        
-        mesh = ax_heatmap.pcolormesh(xx1, xx2, z, shading="auto", cmap="viridis", alpha=0.5)
-        fig.colorbar(mesh, ax=ax_heatmap, label="f(x)")
-        
-        for e in edges:
-            ax_heatmap.axvline(e, color="black", linestyle="--", alpha=0.3)
-        
-        ax_heatmap.set_xlabel(self.feature_names[idx_1])
-        ax_heatmap.set_ylabel(self.feature_names[idx_2])
-        ax_heatmap.set_title(f"Heatmap of {self.f.__name__ if hasattr(self.f, '__name__') else 'model'}")
-
-        # --- Right: g-value curves ---
-        for l in range(L):
-            ax_effect.plot(edges, g_vals[:, l], color=colors[l], label=f"Path {l}")
-        for e in edges:
-            ax_effect.axvline(e, color="black", linestyle="--", alpha=0.3)
-        ax_effect.axhline(0, color="black", alpha=0.2)
-        ax_effect.set_xlabel(self.feature_names[idx_1])
-        ax_effect.set_ylabel("Centered g-value")
-        ax_effect.set_title(f"G-value curves for {self.feature_names[idx_1]}")
-        ax_effect.legend(loc="best", fontsize="small")
-
-        fig.tight_layout()
-        return fig, (ax_data, ax_heatmap, ax_effect)
 
 
 # Bootstrap ALE is just like ALE but subsamples the data with replacement
@@ -814,7 +740,6 @@ class BootstrapALE(Explanation):
         verbose=True,
         interpolate=True,
         centering="x",
-        knn_smooth=None,
         seed=None,
         random_seed=42,
     ):
@@ -848,7 +773,6 @@ class BootstrapALE(Explanation):
         self.verbose = verbose
         self.interpolate = interpolate
         self.centering = centering
-        self.knn_smooth = knn_smooth
         self.seed = 42 if seed is None else seed
         self.random_seed = random_seed
 
@@ -870,7 +794,6 @@ class BootstrapALE(Explanation):
                     verbose=self.verbose,
                     interpolate=self.interpolate,
                     centering=self.centering,
-                    knn_smooth=self.knn_smooth,
                     random_seed=self.random_seed,
                 )
                 self.ale_replications.append(ale_r)
@@ -886,7 +809,6 @@ class BootstrapALE(Explanation):
                     verbose=self.verbose,
                     interpolate=self.interpolate,
                     centering=self.centering,
-                    knn_smooth=self.knn_smooth,
                     random_seed=self.random_seed,
                 )
             ]
@@ -923,8 +845,7 @@ class BootstrapALE(Explanation):
     def explain_local(
         self,
         X_explain,
-        levels_up=0,
-        local_method="interpolate",
+        local_method="path_rep",
         background_size=None,
         background_seed=None,
         boundary_interp=False,
@@ -937,7 +858,6 @@ class BootstrapALE(Explanation):
         for ale_r in self.ale_replications:
             exp_r = ale_r.explain_local(
                 X_explain,
-                levels_up=levels_up,
                 local_method=local_method,
                 background_size=background_size,
                 background_seed=background_seed,

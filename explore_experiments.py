@@ -22,6 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import joblib
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -30,14 +31,17 @@ from sklearn.metrics import r2_score
 
 import models
 from ale import ALE, BootstrapALE
+from ale.plotting import plot_paths_summary
 from shapley import SHAP
+from experiments_io import rebuild_ale_from_run
 from summarize_experiments import (
     _walk_cache, _load_tune, _fmt_cell,
 )
 from visualize_experiments import (
     load_cache, extract_view, detect_explanation_fn,
     plot_bias2, plot_variance, plot_f_variability, plot_f_variance,
-    plot_single_replication, plot_mean_explanations,
+    plot_single_replication,
+    plot_mean_feature_explanations, plot_mean_function_additivity,
 )
 
 
@@ -98,7 +102,8 @@ def generate_plots(cache_dir: str, config_name: str, results_file: str,
     plot_f_variability(view, save_dir=plot_dir)
     plot_f_variance(view, save_dir=plot_dir)
     plot_single_replication(view, r=0, save_dir=plot_dir)
-    plot_mean_explanations(view, save_dir=plot_dir)
+    plot_mean_feature_explanations(view, save_dir=plot_dir)
+    plot_mean_function_additivity(view, save_dir=plot_dir)
     return plot_dir
 
 
@@ -111,31 +116,18 @@ def _build_paths_ale(cache_dir: str, config_name: str, results_file: str, ale_ta
     if ale_entry is None or ale_entry.get("config") is None:
         return None
     ec = ale_entry["config"]
-    # `method` is a newer field; default to "connected" for older cached configs.
-    method = getattr(ec, "method", "connected")
-    random_seed = getattr(ec, "random_seed", 42)
-    include_key = f"total_{method}"
 
     runs = _load_all_replications(cache_dir, config_name, results_file)
     if runs is None:
         return None
-    X, _y, model = runs[0]
 
-    if ec.variant == "bootstrap":
-        ale_obj = BootstrapALE(
-            model.predict, X,
-            replications=ec.n_bootstrap,
-            K=ec.K, L=ec.L, centering=ec.centering,
-            interpolate=ec.interpolate,
-            random_seed=random_seed,
-            verbose=False,
-        )
-        ale_obj.explain(include=(include_key,))
-        return ale_obj.ale_replications[0]
-    ale = ALE(model.predict, X, K=ec.K, L=ec.L, centering=ec.centering,
-              interpolate=ec.interpolate, random_seed=random_seed, verbose=False)
-    ale.explain(include=(include_key,))
-    return ale
+    run_path = os.path.join(cache_dir, config_name, _run_pkl_name(results))
+    return rebuild_ale_from_run(run_path, ec, rep_idx=0)
+
+
+def _run_pkl_name(results: dict) -> str:
+    meta = results["experiment_meta"]
+    return f"run_{meta['dgp_slug']}_{meta['fit_model_slug']}_n{meta['n']}_R{meta['replications']}.pkl"
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +149,7 @@ def _load_all_replications(cache_dir: str, config_name: str, results_file: str):
 
 @st.cache_resource(show_spinner=False)
 def _build_interactive_ale(cache_dir, config_name, results_file, rep_idx,
-                           K, L, centering, interpolate, levels_up):
+                           K, L, centering, interpolate):
     runs = _load_all_replications(cache_dir, config_name, results_file)
     X, _y, model = runs[rep_idx]
     ale = ALE(
@@ -200,15 +192,15 @@ def _render_heatmaps(ale, signal_fn, grid_res: int = 80):
     return fig
 
 
-def _matched_path(ale, j: int, x_query: np.ndarray, levels_up: int) -> int:
+def _matched_path(ale, j: int, x_query: np.ndarray) -> int:
     x_row = x_query[0] if x_query.ndim == 2 else x_query
     indices = ale.connected_forest[j].route_and_pick_representative(
-        x_row, ale.X_values, levels_up=levels_up
+        x_row, ale.X_values
     )["indices"]
     return int(ale.observation_to_path[j][indices[0]])
 
 
-def _decompose_ale_terms(ale, j: int, x_query: np.ndarray, levels_up: int) -> dict:
+def _decompose_ale_terms(ale, j: int, x_query: np.ndarray) -> dict:
     """Decompose the local ALE effect for feature j into its component terms.
 
     Returns a dict with:
@@ -219,7 +211,8 @@ def _decompose_ale_terms(ale, j: int, x_query: np.ndarray, levels_up: int) -> di
       term_path_rep: mean_{x* in path,bin} [f(x_j, x*_{-j}) - f(left, x*_{-j})]
       term_self:     f(x_j, x_{-j}) - f(left, x_{-j})
     """
-    from ale.ale_vim import _local_term_self, _local_term_path_rep, calculate_bin_index
+    from ale.vim import local_term_path_rep as _local_term_path_rep
+    from ale.shared import calculate_bin_index
 
     edges = ale.edges[j]
     gv = ale.centered_g_values[j]
@@ -232,7 +225,7 @@ def _decompose_ale_terms(ale, j: int, x_query: np.ndarray, levels_up: int) -> di
     # matched training point
     x_row = x_query[0] if x_query.ndim == 2 else x_query
     rep_info = ale.connected_forest[j].route_and_pick_representative(
-        x_row, ale.X_values, levels_up=levels_up
+        x_row, ale.X_values
     )
     x_star_idx = rep_info["indices"][0]
     x_star = ale.X_values[x_star_idx]
@@ -258,7 +251,11 @@ def _decompose_ale_terms(ale, j: int, x_query: np.ndarray, levels_up: int) -> di
         alpha_delta = 0.0
 
     # self term: f(x_j, x_{-j}) - f(left, x_{-j}) using explain point's own values
-    term_self = float(_local_term_self(ale.f, x_explain, j, edges[k]))
+    X_self = np.tile(x_explain, (2, 1)).astype(float)
+    X_self[0, j] = edges[k]
+    X_self[1, j] = x_explain[j]
+    f_self = ale.f(X_self)
+    term_self = float(f_self[1] - f_self[0])
 
     # path_rep term
     k_x = ale.k_x[j]
@@ -296,7 +293,7 @@ def _shap_at(cache_dir, config_name, results_file, rep_idx, x_tuple):
     return np.asarray(shap.explain_local(x_query, method="exact_shap"))[0]
 
 
-def _render_feature_panel(ale, j: int, x_query: np.ndarray, levels_up: int):
+def _render_feature_panel(ale, j: int, x_query: np.ndarray):
     from ale.shared import linear_interpolation
 
     edges = ale.edges[j]
@@ -305,7 +302,7 @@ def _render_feature_panel(ale, j: int, x_query: np.ndarray, levels_up: int):
     L = g.shape[1]
     interpolate = g.shape[0] == K + 1
 
-    l_match = _matched_path(ale, j, x_query, levels_up)
+    l_match = _matched_path(ale, j, x_query)
 
     fig, (ax_g, ax_sc) = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -321,7 +318,7 @@ def _render_feature_panel(ale, j: int, x_query: np.ndarray, levels_up: int):
         x0, x1e = edges[k_star], edges[k_star + 1]
         y0, y1 = g[k_star, l_match], g[k_star + 1, l_match]
         yq = float(linear_interpolation(xq, x0, x1e, np.array([y0]), np.array([y1])))
-        ax_g.scatter([xq], [yq], color="red", s=80, zorder=5, label=f"x_{j+1}={xq:.2f}")
+        ax_g.scatter([xq], [yq], color="red", s=80, zorder=5, label=f"x_{j}={xq:.2f}")
     else:
         midpoints = 0.5 * (edges[:-1] + edges[1:])
         for l in range(L):
@@ -334,9 +331,9 @@ def _render_feature_panel(ale, j: int, x_query: np.ndarray, levels_up: int):
 
     for e in edges:
         ax_g.axvline(e, color="black", linestyle="--", alpha=0.15)
-    ax_g.set_xlabel(f"x_{j+1}")
+    ax_g.set_xlabel(f"x_{j}")
     ax_g.set_ylabel("centered g-value")
-    ax_g.set_title(f"g-values for feature {j+1}  (matched path: {l_match})")
+    ax_g.set_title(f"g-values for feature {j}  (matched path: {l_match})")
     ax_g.legend(loc="best")
 
     l_x = ale.observation_to_path[j]
@@ -362,23 +359,216 @@ def _render_feature_panel(ale, j: int, x_query: np.ndarray, levels_up: int):
             ax_sc.axhline(e, color="black", linestyle="--", alpha=0.15)
 
     ax_sc.set_xlabel("x_1"); ax_sc.set_ylabel("x_2")
-    ax_sc.set_title(f"Training points — paths for feature {j+1}")
+    ax_sc.set_title(f"Training points — paths for feature {j}")
     ax_sc.legend(loc="best")
 
     fig.tight_layout()
     return fig
 
 
-def _render_interactive_section(cache_dir, config_name, results_file, row_meta) -> None:
-    st.header("Interactive Mode")
+def _compute_pi_single_bg_info(ale, j: int, x_query: np.ndarray, bg_idx: int,
+                               boundary_interp: bool = False) -> dict:
+    """
+    Decompose the path-integral contribution for feature j from one background point.
 
+    Returns {'k_bg', 'k_star', 'segments', 'total'}.  Each segment has:
+      type         – 'same' | 'lt_L' | 'lt_mid' | 'lt_R' | 'gt_L' | 'gt_mid' | 'gt_R'
+      k            – bin index the segment corresponds to
+      contribution – signed float contribution to the local effect
+      bg_idx       – training index of the background point (or None for const terms)
+      mid_idx      – training index routed to for intermediate bins (or None)
+    """
+    from ale.vim import route_first_index_at_bin as _route_numeric_first_index_known_k
+
+    idx = j
+    x_star = x_query[0].astype(float)
+    x_bg   = ale.X_values[bg_idx].astype(float)
+
+    edges   = ale.edges[j]
+    K       = len(edges) - 1
+    deltas  = ale.deltas[j]
+    k_x     = ale.k_x[j]
+    forest  = ale.connected_forest[j]
+    cat_j   = ale.categorical[j]
+
+    k_bg   = int(k_x[bg_idx])
+    k_star = int(np.clip(np.searchsorted(edges, x_star[j], side="right") - 1, 0, K - 1))
+
+    segments: list = []
+
+    if k_bg == k_star:
+        if boundary_interp:
+            bw = float(edges[k_bg + 1] - edges[k_bg]) if k_bg + 1 < len(edges) else 1.0
+            contrib = float((x_star[j] - x_bg[j]) / bw * deltas[bg_idx]) if bw > 0 else 0.0
+        else:
+            x_tmp = x_bg.copy(); x_tmp[j] = x_star[j]
+            contrib = float(ale.f(x_tmp.reshape(1, -1)) - ale.f(x_bg.reshape(1, -1)))
+        segments.append({'type': 'same', 'k': k_bg, 'contribution': contrib,
+                         'bg_idx': bg_idx, 'mid_idx': None})
+
+    elif k_bg < k_star:
+        # L-term: endpoint at x_bg's right edge
+        if boundary_interp:
+            bw = float(edges[k_bg + 1] - edges[k_bg])
+            contrib_L = float((edges[k_bg + 1] - x_bg[j]) / bw * deltas[bg_idx]) if bw > 0 else 0.0
+        else:
+            x_tmp = x_bg.copy(); x_tmp[j] = edges[k_bg + 1]
+            contrib_L = float(ale.f(x_tmp.reshape(1, -1)) - ale.f(x_bg.reshape(1, -1)))
+        segments.append({'type': 'lt_L', 'k': k_bg, 'contribution': contrib_L,
+                         'bg_idx': bg_idx, 'mid_idx': None})
+
+        # Middle bins
+        diff_bins = k_star - k_bg
+        for k_mid in range(k_bg + 1, k_star):
+            if cat_j:
+                alpha = (k_mid - k_bg) / diff_bins
+                z = x_bg + alpha * (x_star - x_bg); z[j] = edges[k_mid]
+            else:
+                mid_bin = 0.5 * (edges[k_mid] + edges[k_mid + 1])
+                alpha   = (mid_bin - x_star[j]) / (x_star[j] - x_bg[j])
+                z = x_bg + alpha * (x_star - x_bg); z[j] = mid_bin
+            i_mid = _route_numeric_first_index_known_k(forest, z, k_mid)
+            segments.append({'type': 'lt_mid', 'k': k_mid,
+                             'contribution': float(deltas[i_mid]),
+                             'bg_idx': None, 'mid_idx': int(i_mid)})
+
+        # R-term: constant wrt bg, depends only on x_star
+        if boundary_interp:
+            bw = float(edges[k_star + 1] - edges[k_star]) if k_star + 1 < len(edges) else 1.0
+            i_xs = _route_numeric_first_index_known_k(forest, x_star, k_star)
+            contrib_R = float((x_star[j] - edges[k_star]) / bw * deltas[i_xs]) if bw > 0 else 0.0
+        else:
+            x_tmp = x_star.copy(); x_tmp[j] = edges[k_star]
+            contrib_R = float(ale.f(x_star.reshape(1, -1)) - ale.f(x_tmp.reshape(1, -1)))
+        segments.append({'type': 'lt_R', 'k': k_star, 'contribution': contrib_R,
+                         'bg_idx': None, 'mid_idx': None})
+
+    else:
+        # gt case: walking from x_star to x_bg, sign = -1
+        # L-term: constant wrt bg, depends only on x_star
+        if boundary_interp:
+            bw = float(edges[k_star + 1] - edges[k_star]) if k_star + 1 < len(edges) else 1.0
+            i_xs = _route_numeric_first_index_known_k(forest, x_star, k_star)
+            raw_L = float((edges[k_star + 1] - x_star[j]) / bw * deltas[i_xs]) if bw > 0 else 0.0
+        else:
+            x_tmp = x_star.copy(); x_tmp[j] = edges[k_star + 1]
+            raw_L = float(ale.f(x_tmp.reshape(1, -1)) - ale.f(x_star.reshape(1, -1)))
+        segments.append({'type': 'gt_L', 'k': k_star, 'contribution': -raw_L,
+                         'bg_idx': None, 'mid_idx': None})
+
+        # Middle bins
+        diff_bins = k_bg - k_star
+        for k_mid in range(k_star + 1, k_bg):
+            if cat_j:
+                alpha = (k_mid - k_star) / diff_bins
+                z = x_star + alpha * (x_bg - x_star); z[j] = edges[k_mid]
+            else:
+                mid_bin = 0.5 * (edges[k_mid] + edges[k_mid + 1])
+                alpha   = (mid_bin - x_star[j]) / (x_bg[j] - x_star[j])
+                z = x_star + alpha * (x_bg - x_star); z[j] = mid_bin
+            i_mid = _route_numeric_first_index_known_k(forest, z, k_mid)
+            segments.append({'type': 'gt_mid', 'k': k_mid,
+                             'contribution': float(-deltas[i_mid]),
+                             'bg_idx': None, 'mid_idx': int(i_mid)})
+
+        # R-term: endpoint at x_bg's left edge
+        if boundary_interp:
+            k_plus = min(k_bg + 1, len(edges) - 1)
+            bw = float(edges[k_plus] - edges[k_bg])
+            contrib_R = float((x_bg[j] - edges[k_bg]) / bw * deltas[bg_idx]) if bw > 0 else 0.0
+        else:
+            x_tmp = x_bg.copy(); x_tmp[j] = edges[k_bg]
+            contrib_R = float(ale.f(x_bg.reshape(1, -1)) - ale.f(x_tmp.reshape(1, -1)))
+        segments.append({'type': 'gt_R', 'k': k_bg, 'contribution': -contrib_R,
+                         'bg_idx': bg_idx, 'mid_idx': None})
+
+    return {
+        'k_bg': k_bg,
+        'k_star': k_star,
+        'segments': segments,
+        'total': sum(s['contribution'] for s in segments),
+    }
+
+
+def _render_pi_feature_panel(ale, j: int, x_query: np.ndarray, bg_idx: int,
+                              boundary_interp: bool):
+    """Scatter + contribution bar for one feature in path-integral mode."""
+    info = _compute_pi_single_bg_info(ale, j, x_query, bg_idx, boundary_interp)
+    segments = info['segments']
+    edges = ale.edges[j]
+    X = ale.X_values
+    x_bg   = X[bg_idx]
+    x_star = x_query[0]
+
+    # Collect all matched training indices to highlight
+    mid_indices = [s['mid_idx'] for s in segments if s['mid_idx'] is not None]
+
+    fig, (ax_sc, ax_bar) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Scatter: all points (dim), bg (blue square), query (red star), mid points (orange) ---
+    ax_sc.scatter(X[:, 0], X[:, 1], s=8, color="gray", alpha=0.25, zorder=1)
+    ax_sc.scatter([x_bg[0]], [x_bg[1]], marker="s", s=200, color="C0",
+                  edgecolor="black", linewidth=0.8, zorder=4, label=f"x_bg (idx {bg_idx})")
+    ax_sc.scatter([x_star[0]], [x_star[1]], marker="*", s=280, color="red",
+                  edgecolor="black", linewidth=0.8, zorder=5, label="x_query")
+    if mid_indices:
+        mid_segs = [s for s in segments if s['mid_idx'] is not None]
+        for s in mid_segs:
+            pt = X[s['mid_idx']]
+            ax_sc.scatter([pt[0]], [pt[1]], marker="D", s=120, color="C1",
+                          edgecolor="black", linewidth=0.5, zorder=3)
+            ax_sc.annotate(f"k={s['k']}", xy=(pt[0], pt[1]), xytext=(4, 4),
+                           textcoords="offset points", fontsize=7)
+
+    for e in edges:
+        if j == 0:
+            ax_sc.axvline(e, color="black", linestyle="--", alpha=0.15)
+        else:
+            ax_sc.axhline(e, color="black", linestyle="--", alpha=0.15)
+    # highlight query bin edge pair
+    k_star = info['k_star']
+    k_bg_v = info['k_bg']
+    for k_hi, col in [(k_star, "red"), (k_bg_v, "C0")]:
+        lo, hi = edges[k_hi], edges[k_hi + 1] if k_hi + 1 < len(edges) else edges[-1]
+        if j == 0:
+            ax_sc.axvspan(lo, hi, alpha=0.08, color=col)
+        else:
+            ax_sc.axhspan(lo, hi, alpha=0.08, color=col)
+
+    ax_sc.set_xlabel("x_1"); ax_sc.set_ylabel("x_2")
+    ax_sc.set_title(f"Feature {j} path  (k_bg={k_bg_v} → k*={k_star})")
+    ax_sc.legend(loc="best", fontsize=8)
+
+    # --- Bar chart of per-segment contributions ---
+    labels = [f"{s['type']}\nk={s['k']}" for s in segments]
+    values = [s['contribution'] for s in segments]
+    colors = []
+    for s in segments:
+        if s['type'] == 'same':       colors.append("C2")
+        elif s['type'] in ('lt_L', 'gt_R'): colors.append("C0")   # bg endpoint
+        elif s['type'] in ('lt_mid', 'gt_mid'): colors.append("C1")  # intermediate
+        else:                         colors.append("gray")          # const R/L term
+    bars = ax_bar.barh(labels, values, color=colors, edgecolor="black", linewidth=0.5)
+    ax_bar.axvline(0, color="black", linewidth=0.8)
+    total = info['total']
+    ax_bar.set_title(f"Feature {j} contributions  (total={total:.4f})")
+    ax_bar.set_xlabel("Contribution")
+    for bar, val in zip(bars, values):
+        ax_bar.text(val + (0.002 if val >= 0 else -0.002), bar.get_y() + bar.get_height() / 2,
+                    f"{val:.4f}", va="center", ha="left" if val >= 0 else "right", fontsize=7)
+
+    fig.tight_layout()
+    return fig, info
+
+
+def _render_path_integral_section(cache_dir, config_name, results_file, row_meta) -> None:
     runs = _load_all_replications(cache_dir, config_name, results_file)
     if runs is None:
         st.warning("Could not locate the run_*.pkl companion file for this experiment.")
         return
     R = len(runs)
 
-    ukey = f"{config_name}_{results_file}"
+    ukey = f"pi_{config_name}_{results_file}"
 
     rep_idx = st.number_input(
         "Replication index", min_value=0, max_value=max(R - 1, 0),
@@ -402,15 +592,569 @@ def _render_interactive_section(cache_dir, config_name, results_file, row_meta) 
     with cols[3]:
         interpolate = st.checkbox("interpolate", value=True, key=f"interp_{ukey}")
     with cols[4]:
-        levels_up = st.number_input(
-            "levels_up", min_value=0, value=int(row_meta.get("levels_up") or 0),
-            step=1, key=f"lu_{ukey}",
-        )
+        boundary_interp = st.checkbox("boundary_interp", value=False,
+                                      key=f"bi_{ukey}")
 
     with st.spinner("Fitting ALE…"):
         ale, X, model = _build_interactive_ale(
             cache_dir, config_name, results_file, int(rep_idx),
-            int(K), int(L), centering, bool(interpolate), int(levels_up),
+            int(K), int(L), centering, bool(interpolate), 0,
+        )
+
+    n = ale.X_values.shape[0]
+
+    st.subheader("Query point")
+    qcols = st.columns(2)
+    with qcols[0]:
+        x1q = st.number_input("x_1", value=0.0, step=0.1,
+                               key=f"x1_{ukey}", format="%.4f")
+    with qcols[1]:
+        x2q = st.number_input("x_2", value=0.0, step=0.1,
+                               key=f"x2_{ukey}", format="%.4f")
+    x_query = np.array([[float(x1q), float(x2q)]])
+
+    bg_idx = st.number_input(
+        f"Background point index (0 – {n - 1})",
+        min_value=0, max_value=n - 1, value=0, step=1,
+        key=f"bg_{ukey}",
+    )
+    bg_idx = int(bg_idx)
+    x_bg = ale.X_values[bg_idx]
+    st.caption(
+        f"x_bg = ({', '.join(f'{v:.4f}' for v in x_bg)})  "
+        f"  |  x_query = ({x1q:.4f}, {x2q:.4f})"
+    )
+
+    with st.expander("Per-feature path decomposition", expanded=True):
+        for j in range(2):
+            st.subheader(f"Feature {j}")
+            try:
+                with st.spinner(f"Computing feature {j}…"):
+                    fig, info = _render_pi_feature_panel(
+                        ale, j, x_query, bg_idx, bool(boundary_interp)
+                    )
+                st.pyplot(fig)
+                plt.close(fig)
+            except Exception as e:
+                st.warning(f"Feature {j} decomposition failed: {e}")
+
+    st.subheader("Explanation comparison at query")
+    comparison_rows = []
+    for j in range(2):
+        comparison_rows.append({"feature": f"x_{j}", "path_integral": float("nan"),
+                                 "ALE (path_rep)": float("nan"), "SHAP": float("nan")})
+
+    try:
+        pi_vals = ale.explain_local(
+            x_query,
+            local_method="path_integral",
+            boundary_interp=bool(boundary_interp),
+        )[0]
+        for j in range(2):
+            comparison_rows[j]["path_integral"] = float(pi_vals[j])
+    except Exception as e:
+        st.caption(f"explain_local (path_integral) failed: {e}")
+
+    try:
+        pr_vals = ale.explain_local(x_query, local_method="path_rep")[0]
+        for j in range(2):
+            comparison_rows[j]["ALE (path_rep)"] = float(pr_vals[j])
+    except Exception as e:
+        st.caption(f"explain_local (path_rep) failed: {e}")
+
+    try:
+        shap_vals = _shap_at(cache_dir, config_name, results_file, int(rep_idx),
+                             (float(x1q), float(x2q)))
+        for j in range(2):
+            comparison_rows[j]["SHAP"] = float(shap_vals[j])
+    except Exception as e:
+        st.caption(f"SHAP failed: {e}")
+
+    st.dataframe(pd.DataFrame(comparison_rows).set_index("feature"))
+
+
+def _compute_mp_single_bg_info(ale, j: int, x_query: np.ndarray, bg_idx: int) -> dict:
+    """
+    Decompose the multi_path contribution for feature j from one background point.
+
+    Multi_path is always boundary_interp-style (no f calls): boundary terms use
+    `alpha * leaf_mean_delta` instead of f-differences, and middle bins assign
+    one tree node (possibly internal) per bin using depth-interpolation between
+    the bg's leaf A and x*'s leaf B; the node's per-bin mean delta is the
+    contribution.
+
+    Returns {'k_bg', 'k_star', 'leaf_A', 'leaf_B', 'tree_path', 'segments', 'total'}.
+    Each segment has:
+      type         – 'same' | 'lt_L' | 'lt_mid' | 'lt_R' | 'gt_L' | 'gt_mid' | 'gt_R'
+      k            – bin index the segment corresponds to
+      contribution – signed float contribution to the local effect
+      bg_idx       – training index of the bg point (only for bg-endpoint segments)
+      node         – the assigned KDNode (for mid + endpoint segments)
+      indices      – ndarray of UNIQUE training indices in the assigned node's
+                     subtree restricted to bin k (used for scatter highlighting)
+      obs_weights  – ndarray aligned with `indices`: each entry is this
+                     observation's signed weight contribution to this segment
+                     (sum of segment-coef/n_per_bin distributed across leaf
+                     occurrences). Sum equals `contribution / mean_delta[k]`.
+      node_is_leaf – bool
+    """
+    from ale.tree_partitioning import iter_subtree_indices_at_bin
+    x_star = x_query[0].astype(float)
+    x_bg = ale.X_values[bg_idx].astype(float)
+
+    edges = ale.edges[j]
+    K = len(edges) - 1
+    forest = ale.connected_forest[j]
+    k_x = ale.k_x[j]
+
+    k_bg = int(k_x[bg_idx])
+    k_star = int(np.clip(np.searchsorted(edges, x_star[j], side="right") - 1, 0, K - 1))
+
+    # Route both points through the forest to get leaves + descent paths.
+    bg_info = forest.route_with_path(x_bg, k=k_bg)
+    star_info = forest.route_with_path(x_star, k=k_star)
+    leaf_A = bg_info["leaf"]
+    leaf_B = star_info["leaf"]
+    path_A = bg_info["path"]
+    path_B = star_info["path"]
+    tree_path = forest.tree_path_between(path_A, path_B)
+
+    bw_xstar = float(edges[k_star + 1] - edges[k_star]) if k_star + 1 < len(edges) else 0.0
+    bw_bg = float(edges[k_bg + 1] - edges[k_bg]) if k_bg + 1 < len(edges) else 0.0
+
+    def _idxs(node, k):
+        return forest._collect_leaf_indices(node, k)
+
+    def _safe_mean(node, k):
+        v = float(node.mean_delta[k])
+        return 0.0 if np.isnan(v) else v
+
+    def _obs_weights(node, k, coef):
+        """Per-observation signed weight contribution from a single
+        `coef * node.mean_delta[k]` term. Distributes `coef / n_per_bin[k]`
+        across all leaf occurrences in the subtree, then collapses to a
+        unique-index view (multiplicities folded into the weight).
+
+        Returns (unique_indices, weights_aligned) with shape (m,), (m,).
+        """
+        n_k = int(node.n_per_bin[k])
+        if n_k == 0 or coef == 0.0:
+            return np.empty(0, dtype=int), np.empty(0, dtype=float)
+        occ = iter_subtree_indices_at_bin(node, k)
+        if occ.size == 0:
+            return np.empty(0, dtype=int), np.empty(0, dtype=float)
+        uniq, counts = np.unique(occ, return_counts=True)
+        return uniq, (coef / n_k) * counts.astype(float)
+
+    segments: list = []
+
+    def _push_segment(seg_type, k, coef, node, sign=1.0, bg_idx_field=None):
+        signed_coef = sign * coef
+        mean_d = _safe_mean(node, k)
+        contribution = float(signed_coef * mean_d)
+        uniq, w = _obs_weights(node, k, signed_coef)
+        segments.append({
+            'type': seg_type,
+            'k': k,
+            'contribution': contribution,
+            'bg_idx': bg_idx_field,
+            'node': node,
+            'indices': uniq,
+            'obs_weights': w,
+            'node_is_leaf': bool(node.is_leaf),
+        })
+
+    if k_bg == k_star:
+        coef = (x_star[j] - x_bg[j]) / bw_xstar if bw_xstar > 0 else 0.0
+        _push_segment('same', k_bg, coef, leaf_A, bg_idx_field=bg_idx)
+
+    elif k_bg < k_star:
+        alpha_L = (edges[k_bg + 1] - x_bg[j]) / bw_bg if bw_bg > 0 else 0.0
+        alpha_R = (x_star[j] - edges[k_star]) / bw_xstar if bw_xstar > 0 else 0.0
+
+        _push_segment('lt_L', k_bg, alpha_L, leaf_A, bg_idx_field=bg_idx)
+
+        M = k_star - k_bg - 1
+        if M > 0:
+            nodes = forest.assign_middle_nodes(tree_path, M)
+            for off, node in enumerate(nodes):
+                k_mid = k_bg + 1 + off
+                _push_segment('lt_mid', k_mid, 1.0, node)
+
+        _push_segment('lt_R', k_star, alpha_R, leaf_B)
+
+    else:
+        # gt: walk x* → x_bg, sign = -1
+        k_bg_plus = min(k_bg + 1, len(edges) - 1)
+        bw_bg_gt = float(edges[k_bg_plus] - edges[k_bg]) if k_bg_plus > k_bg else 0.0
+        alpha_R = (x_bg[j] - edges[k_bg]) / bw_bg_gt if bw_bg_gt > 0 else 0.0
+        alpha_L = (edges[k_star + 1] - x_star[j]) / bw_xstar if bw_xstar > 0 else 0.0
+
+        _push_segment('gt_L', k_star, alpha_L, leaf_B, sign=-1.0)
+
+        M = k_bg - k_star - 1
+        if M > 0:
+            rev_path = list(reversed(tree_path))
+            nodes = forest.assign_middle_nodes(rev_path, M)
+            for off, node in enumerate(nodes):
+                k_mid = k_star + 1 + off
+                _push_segment('gt_mid', k_mid, 1.0, node, sign=-1.0)
+
+        _push_segment('gt_R', k_bg, alpha_R, leaf_A, sign=-1.0,
+                      bg_idx_field=bg_idx)
+
+    return {
+        'k_bg': k_bg,
+        'k_star': k_star,
+        'leaf_A': leaf_A,
+        'leaf_B': leaf_B,
+        'tree_path': tree_path,
+        'segments': segments,
+        'total': float(sum(s['contribution'] for s in segments)),
+    }
+
+
+def _render_mp_feature_panel(ale, j: int, x_query: np.ndarray, bg_idx: int):
+    """Scatter + contribution bar for one feature in multi_path mode.
+
+    The scatter shades subtree members for each segment's assigned tree node
+    (multiple training points when the node is internal — visualizing the
+    "averaging more" behavior of higher ancestors).
+    """
+    info = _compute_mp_single_bg_info(ale, j, x_query, bg_idx)
+    segments = info['segments']
+    edges = ale.edges[j]
+    X = ale.X_values
+    x_bg = X[bg_idx]
+    x_star = x_query[0]
+
+    fig, (ax_sc, ax_bar) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # All training points (dim).
+    ax_sc.scatter(X[:, 0], X[:, 1], s=8, color="gray", alpha=0.20, zorder=1)
+
+    # Distinct colors per middle segment to show progression through tree.
+    mid_segs = [s for s in segments if s['type'] in ('lt_mid', 'gt_mid')]
+    n_mid = len(mid_segs)
+    cmap = plt.get_cmap("plasma")
+
+    # Find a per-figure scale so the largest |obs_weight| renders at a
+    # readable size; small weights still get a baseline so they are visible.
+    all_w = np.concatenate(
+        [np.abs(s.get('obs_weights', np.empty(0))) for s in segments]
+    ) if segments else np.empty(0)
+    w_max = float(all_w.max()) if all_w.size and all_w.max() > 0 else 1.0
+    BASE = 18.0
+    SCALE = 180.0
+
+    def _sizes(weights):
+        return BASE + SCALE * (np.abs(weights) / w_max)
+
+    # Highlight bg-leaf and query-leaf subtree members at their respective bins.
+    for s in segments:
+        if s['type'] in ('lt_L', 'gt_R', 'same'):
+            color, marker = "C0", "o"
+        elif s['type'] in ('lt_R', 'gt_L'):
+            color, marker = "C3", "o"
+        else:
+            continue
+        idxs = s['indices']
+        weights = s.get('obs_weights', np.zeros(idxs.size))
+        if idxs.size:
+            ax_sc.scatter(
+                X[idxs, 0], X[idxs, 1], s=_sizes(weights), color=color, alpha=0.55,
+                edgecolor="black", linewidth=0.4, zorder=2, marker=marker,
+            )
+
+    # Middle nodes: color-coded by their position in the walk; size scaled
+    # by each observation's signed weight contribution (replaces old
+    # subtree-size proxy so dots reflect actual importance).
+    for i, s in enumerate(mid_segs):
+        idxs = s['indices']
+        weights = s.get('obs_weights', np.zeros(idxs.size))
+        if not idxs.size:
+            continue
+        col = cmap(i / max(n_mid - 1, 1))
+        ax_sc.scatter(
+            X[idxs, 0], X[idxs, 1], s=_sizes(weights), color=col, alpha=0.65,
+            edgecolor="black", linewidth=0.4, zorder=3,
+            marker="D" if s['node_is_leaf'] else "P",
+        )
+        # Label at centroid.
+        cx, cy = float(X[idxs, 0].mean()), float(X[idxs, 1].mean())
+        tag = f"k={s['k']}" + ("" if s['node_is_leaf'] else f" (n={idxs.size})")
+        ax_sc.annotate(tag, xy=(cx, cy), xytext=(4, 4),
+                       textcoords="offset points", fontsize=7, color="black")
+
+    ax_sc.scatter([x_bg[0]], [x_bg[1]], marker="s", s=200, color="C0",
+                  edgecolor="black", linewidth=0.8, zorder=5,
+                  label=f"x_bg (idx {bg_idx})")
+    ax_sc.scatter([x_star[0]], [x_star[1]], marker="*", s=280, color="red",
+                  edgecolor="black", linewidth=0.8, zorder=6, label="x_query")
+
+    for e in edges:
+        if j == 0:
+            ax_sc.axvline(e, color="black", linestyle="--", alpha=0.15)
+        else:
+            ax_sc.axhline(e, color="black", linestyle="--", alpha=0.15)
+
+    k_star_v = info['k_star']
+    k_bg_v = info['k_bg']
+    for k_hi, col in [(k_star_v, "red"), (k_bg_v, "C0")]:
+        lo = edges[k_hi]
+        hi = edges[k_hi + 1] if k_hi + 1 < len(edges) else edges[-1]
+        if j == 0:
+            ax_sc.axvspan(lo, hi, alpha=0.08, color=col)
+        else:
+            ax_sc.axhspan(lo, hi, alpha=0.08, color=col)
+
+    leaf_A_depth = _node_depth(info['leaf_A'])
+    leaf_B_depth = _node_depth(info['leaf_B'])
+    D = len(info['tree_path']) - 1
+    M = max(0, abs(k_star_v - k_bg_v) - 1)
+    ax_sc.set_xlabel("x_1"); ax_sc.set_ylabel("x_2")
+    ax_sc.set_title(
+        f"Feature {j}  (k_bg={k_bg_v} → k*={k_star_v}; "
+        f"depth A={leaf_A_depth}, B={leaf_B_depth}, D={D}, M={M})"
+    )
+    ax_sc.legend(loc="best", fontsize=8)
+
+    # --- Bar chart ---
+    labels = [f"{s['type']}\nk={s['k']}" for s in segments]
+    values = [s['contribution'] for s in segments]
+    colors = []
+    for s in segments:
+        if s['type'] == 'same':                    colors.append("C2")
+        elif s['type'] in ('lt_L', 'gt_R'):        colors.append("C0")
+        elif s['type'] in ('lt_R', 'gt_L'):        colors.append("C3")
+        else:                                       colors.append("C1")
+    bars = ax_bar.barh(labels, values, color=colors, edgecolor="black", linewidth=0.5)
+    ax_bar.axvline(0, color="black", linewidth=0.8)
+    ax_bar.set_title(f"Feature {j} contributions  (total={info['total']:.4f})")
+    ax_bar.set_xlabel("Contribution")
+    for bar, val in zip(bars, values):
+        ax_bar.text(val + (0.002 if val >= 0 else -0.002),
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{val:.4f}", va="center",
+                    ha="left" if val >= 0 else "right", fontsize=7)
+
+    fig.tight_layout()
+    return fig, info
+
+
+def _render_mp_query_weight_panel(ale, x_query: np.ndarray, local_method: str):
+    """Per-feature scatter showing each training observation's signed weight
+    contribution to the local explanation at `x_query`. Weights come from
+    `ALE.explain_local_weights`, which exposes the linear-combination view of
+    the multi_path / multi_path_interpolate estimator over deltas.
+    """
+    d = ale.X_values.shape[1]
+    W = ale.explain_local_weights(x_query, local_method=local_method)[0]  # (d, n_train)
+    X = ale.X_values
+    deltas = [ale.deltas[j] for j in range(d)]
+
+    n_cols = d
+    fig, axes = plt.subplots(1, n_cols, figsize=(5.0 * n_cols, 4.5), squeeze=False)
+    axes = axes[0]
+    for j in range(d):
+        ax = axes[j]
+        w = W[j]
+        recon = float(w @ deltas[j])
+
+        wmax = float(np.abs(w).max())
+        norm = mcolors.TwoSlopeNorm(vmin=-wmax if wmax > 0 else -1.0,
+                                    vcenter=0.0,
+                                    vmax=wmax if wmax > 0 else 1.0)
+        size_scale = (np.abs(w) / wmax) * 120.0 + 8.0 if wmax > 0 else np.full_like(w, 8.0)
+        sc = ax.scatter(X[:, 0], X[:, 1], c=w, cmap="coolwarm", norm=norm,
+                        s=size_scale, alpha=0.85, edgecolor="black",
+                        linewidth=0.3, zorder=2)
+        ax.scatter([x_query[0, 0]], [x_query[0, 1]], marker="*", s=260,
+                   color="gold", edgecolor="black", linewidth=0.8, zorder=4,
+                   label="x_query")
+        ax.set_xlabel("x_1"); ax.set_ylabel("x_2")
+        ax.set_title(f"Feature {j}  W·delta = {recon:.4f}")
+        ax.legend(loc="best", fontsize=8)
+        fig.colorbar(sc, ax=ax, shrink=0.85, label="weight on delta[obs]")
+
+    fig.suptitle(f"explain_local_weights ({local_method}) at x_query", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def _node_depth(node) -> int:
+    """Tree depth of a node (root has depth 0). Requires parent pointers."""
+    d = 0
+    cur = node
+    while getattr(cur, "parent", None) is not None:
+        cur = cur.parent
+        d += 1
+    return d
+
+
+def _render_multi_path_section(cache_dir, config_name, results_file, row_meta) -> None:
+    runs = _load_all_replications(cache_dir, config_name, results_file)
+    if runs is None:
+        st.warning("Could not locate the run_*.pkl companion file for this experiment.")
+        return
+    R = len(runs)
+
+    ukey = f"mp_{config_name}_{results_file}"
+
+    rep_idx = st.number_input(
+        "Replication index", min_value=0, max_value=max(R - 1, 0),
+        value=0, step=1, key=f"rep_{ukey}",
+    )
+
+    cols = st.columns(4)
+    with cols[0]:
+        K = st.number_input("K", min_value=2, value=int(row_meta.get("K") or 10),
+                            step=1, key=f"K_{ukey}")
+    with cols[1]:
+        L = st.number_input("L", min_value=1, value=int(row_meta.get("L") or 10),
+                            step=1, key=f"L_{ukey}")
+    with cols[2]:
+        default_centering = str(row_meta.get("centering") or "y")
+        centering = st.selectbox(
+            "centering", options=["y", "x"],
+            index=0 if default_centering == "y" else 1,
+            key=f"centering_{ukey}",
+        )
+    with cols[3]:
+        interpolate = st.checkbox("interpolate", value=True, key=f"interp_{ukey}")
+
+    with st.spinner("Fitting ALE…"):
+        ale, X, model = _build_interactive_ale(
+            cache_dir, config_name, results_file, int(rep_idx),
+            int(K), int(L), centering, bool(interpolate), 0,
+        )
+
+    n = ale.X_values.shape[0]
+
+    st.subheader("Query point")
+    qcols = st.columns(2)
+    with qcols[0]:
+        x1q = st.number_input("x_1", value=0.0, step=0.1,
+                              key=f"x1_{ukey}", format="%.4f")
+    with qcols[1]:
+        x2q = st.number_input("x_2", value=0.0, step=0.1,
+                              key=f"x2_{ukey}", format="%.4f")
+    x_query = np.array([[float(x1q), float(x2q)]])
+
+    bg_idx = st.number_input(
+        f"Background point index (0 – {n - 1})",
+        min_value=0, max_value=n - 1, value=0, step=1,
+        key=f"bg_{ukey}",
+    )
+    bg_idx = int(bg_idx)
+    x_bg = ale.X_values[bg_idx]
+    st.caption(
+        f"x_bg = ({', '.join(f'{v:.4f}' for v in x_bg)})  "
+        f"  |  x_query = ({x1q:.4f}, {x2q:.4f})"
+    )
+
+    with st.expander("Per-feature multi_path decomposition", expanded=True):
+        for j in range(2):
+            st.subheader(f"Feature {j}")
+            try:
+                with st.spinner(f"Computing feature {j}…"):
+                    fig, info = _render_mp_feature_panel(ale, j, x_query, bg_idx)
+                st.pyplot(fig)
+                plt.close(fig)
+            except Exception as e:
+                st.warning(f"Feature {j} decomposition failed: {e}")
+
+    with st.expander(
+        "Full weighting over training observations (explain_local_weights)",
+        expanded=False,
+    ):
+        weight_method = "multi_path_interpolate"
+        try:
+            with st.spinner(f"Computing per-observation weights ({weight_method})…"):
+                fig_w = _render_mp_query_weight_panel(ale, x_query, weight_method)
+            st.pyplot(fig_w)
+            plt.close(fig_w)
+        except Exception as e:
+            st.warning(f"Full-weighting panel failed: {e}")
+
+    st.subheader("Explanation comparison at query")
+    comparison_rows = [
+        {"feature": f"x_{j}", "multi_path_interpolate": float("nan"),
+         "path_integral (bi=True)": float("nan"),
+         "ALE (path_rep)": float("nan"), "SHAP": float("nan")}
+        for j in range(2)
+    ]
+
+    try:
+        mp_vals = ale.explain_local(x_query, local_method="multi_path_interpolate")[0]
+        for j in range(2):
+            comparison_rows[j]["multi_path_interpolate"] = float(mp_vals[j])
+    except Exception as e:
+        st.caption(f"explain_local (multi_path_interpolate) failed: {e}")
+
+    try:
+        pi_vals = ale.explain_local(
+            x_query, local_method="path_integral", boundary_interp=True
+        )[0]
+        for j in range(2):
+            comparison_rows[j]["path_integral (bi=True)"] = float(pi_vals[j])
+    except Exception as e:
+        st.caption(f"explain_local (path_integral) failed: {e}")
+
+    try:
+        pr_vals = ale.explain_local(x_query, local_method="path_rep")[0]
+        for j in range(2):
+            comparison_rows[j]["ALE (path_rep)"] = float(pr_vals[j])
+    except Exception as e:
+        st.caption(f"explain_local (path_rep) failed: {e}")
+
+    try:
+        shap_vals = _shap_at(cache_dir, config_name, results_file, int(rep_idx),
+                             (float(x1q), float(x2q)))
+        for j in range(2):
+            comparison_rows[j]["SHAP"] = float(shap_vals[j])
+    except Exception as e:
+        st.caption(f"SHAP failed: {e}")
+
+    st.dataframe(pd.DataFrame(comparison_rows).set_index("feature"))
+
+
+def _render_interactive_section(cache_dir, config_name, results_file, row_meta) -> None:
+
+    runs = _load_all_replications(cache_dir, config_name, results_file)
+    if runs is None:
+        st.warning("Could not locate the run_*.pkl companion file for this experiment.")
+        return
+    R = len(runs)
+
+    ukey = f"{config_name}_{results_file}"
+
+    rep_idx = st.number_input(
+        "Replication index", min_value=0, max_value=max(R - 1, 0),
+        value=0, step=1, key=f"rep_{ukey}",
+    )
+
+    cols = st.columns(4)
+    with cols[0]:
+        K = st.number_input("K", min_value=2, value=int(row_meta.get("K") or 10),
+                            step=1, key=f"K_{ukey}")
+    with cols[1]:
+        L = st.number_input("L", min_value=1, value=int(row_meta.get("L") or 10),
+                            step=1, key=f"L_{ukey}")
+    with cols[2]:
+        default_centering = str(row_meta.get("centering") or "y")
+        centering = st.selectbox(
+            "centering", options=["y", "x"],
+            index=0 if default_centering == "y" else 1,
+            key=f"centering_{ukey}",
+        )
+    with cols[3]:
+        interpolate = st.checkbox("interpolate", value=True, key=f"interp_{ukey}")
+
+    with st.spinner("Fitting ALE…"):
+        ale, X, model = _build_interactive_ale(
+            cache_dir, config_name, results_file, int(rep_idx),
+            int(K), int(L), centering, bool(interpolate),
         )
 
     _X, y_rep, _m = runs[int(rep_idx)]
@@ -449,8 +1193,8 @@ def _render_interactive_section(cache_dir, config_name, results_file, row_meta) 
 
     with st.expander("Feature g-values and paths", expanded=True):
         for j in range(2):
-            st.subheader(f"Feature {j+1}")
-            st.pyplot(_render_feature_panel(ale, j, x_query, int(levels_up)))
+            st.subheader(f"Feature {j}")
+            st.pyplot(_render_feature_panel(ale, j, x_query))
 
     st.subheader("Local-effect terms at query")
 
@@ -458,9 +1202,9 @@ def _render_interactive_section(cache_dir, config_name, results_file, row_meta) 
     decomp = []
     for j in range(2):
         try:
-            decomp.append(_decompose_ale_terms(ale, j, x_query, int(levels_up)))
+            decomp.append(_decompose_ale_terms(ale, j, x_query))
         except Exception as e:
-            st.caption(f"Decomposition for feature {j+1} failed: {e}")
+            st.caption(f"Decomposition for feature {j} failed: {e}")
             decomp.append(None)
 
     # Show matched x* for each feature
@@ -468,17 +1212,17 @@ def _render_interactive_section(cache_dir, config_name, results_file, row_meta) 
         if decomp[j] is not None:
             xs = decomp[j]["x_star"]
             st.caption(
-                f"Feature {j+1} matched x\\* = "
+                f"Feature {j} matched x\\* = "
                 f"({', '.join(f'{v:.4f}' for v in xs)})"
             )
 
     rows = []
 
-    # Final ALE values (all three methods)
-    for method in ("interpolate", "path_rep", "self", "path_integral"):
+    # Final ALE values for surviving methods
+    for method in ("path_rep", "path_integral"):
         try:
             terms = ale.explain_local(
-                x_query, levels_up=int(levels_up), local_method=method
+                x_query, local_method=method
             )[0]
             rows.append({"method": f"ALE ({method})",
                          "feature_1": float(terms[0]),
@@ -564,7 +1308,7 @@ def _plot_bias_hist(view: dict, true_explanation_fn):
             ax.axvline(bias.mean(), color=color, linestyle=":", linewidth=2)
         ax.set_xlabel("Bias")
         ax.set_ylabel("Count")
-        ax.set_title(f"Feature {j + 1}")
+        ax.set_title(f"Feature {j}")
         ax.legend()
     fig.tight_layout()
     return fig
@@ -595,7 +1339,7 @@ def _plot_stddev_hist(view: dict):
                        label="Std(f)")
         ax.set_xlabel("Std Dev")
         ax.set_ylabel("Count")
-        ax.set_title(f"Feature {j + 1}")
+        ax.set_title(f"Feature {j}")
         ax.legend()
     fig.tight_layout()
 
@@ -603,11 +1347,46 @@ def _plot_stddev_hist(view: dict):
     return fig, f_std_mean
 
 
+def _plot_additivity_hist(view: dict):
+    """Histogram of the per-(replication, grid-point) additivity residual:
+        residual = sum_d phi_d(x) - (f(x) - E[f(X)])
+    One overlaid histogram for ALE and SHAP. Returns (fig, info_dict) or
+    (None, None) if f_means is unavailable on the cached results.
+    """
+    f_vals = view.get("f_vals")
+    f_means = view.get("f_means")
+    if f_vals is None or f_means is None:
+        return None, None
+
+    target = f_vals - np.asarray(f_means)[:, None]  # (R, n_grid)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    info = {}
+    for method, exps, color in [
+        ("ALE", view["ale_exps"], "C0"),
+        ("SHAP", view["shap_exps"], "C1"),
+    ]:
+        residual = exps.sum(axis=-1) - target  # (R, n_grid)
+        flat = residual.ravel()
+        rmse = float(np.sqrt(np.mean(flat ** 2)))
+        ax.hist(flat, bins=60, alpha=0.5, color=color,
+                label=f"{method} (RMSE={rmse:.4f})")
+        ax.axvline(flat.mean(), color=color, linestyle=":", linewidth=2)
+        info[method] = rmse
+    ax.set_xlabel("sum_d φ_d(x) − (f(x) − E[f(X)])")
+    ax.set_ylabel("Count")
+    ax.set_title("Additivity Residual (over replications × grid points)")
+    ax.axvline(0.0, color="k", linestyle="--", linewidth=1)
+    ax.legend()
+    fig.tight_layout()
+    return fig, info
+
+
 # ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
 
 _FILTER_SPECS = [
+    ("Config",      "config_name"),
     ("Signal",      "signal"),
     ("SNR",         "snr"),
     ("Rho",         "rho"),
@@ -808,65 +1587,86 @@ def show_detail_page(cache_dir: str, selected_key: str) -> None:
     view = extract_view(results, ale_tag, shap_tag)
     true_fn = detect_explanation_fn(results)
 
-    bias_fig = _plot_bias_hist(view, true_fn)
-    if bias_fig is not None:
-        st.pyplot(bias_fig)
-    else:
-        st.caption("No rho-independent true explanation available; bias histogram omitted.")
+    with st.expander("Bias (over grid points)", expanded=True):
+        bias_fig = _plot_bias_hist(view, true_fn)
+        if bias_fig is not None:
+            st.pyplot(bias_fig)
+        else:
+            st.caption("No rho-independent true explanation available; bias histogram omitted.")
 
-    stddev_fig, f_std_mean = _plot_stddev_hist(view)
-    st.pyplot(stddev_fig)
-    if f_std_mean is not None:
-        st.caption(f"Mean Std(f(x)) across grid points: {f_std_mean:.4f}")
+    with st.expander("Std Dev (over grid points)", expanded=True):
+        stddev_fig, f_std_mean = _plot_stddev_hist(view)
+        st.pyplot(stddev_fig)
+        if f_std_mean is not None:
+            st.caption(f"Mean Std(f(x)) across grid points: {f_std_mean:.4f}")
 
     with st.spinner("Generating plots…"):
         plot_dir = generate_plots(cache_dir, config_name, results_file, ale_tag, shap_tag)
 
-    def _show(filename: str, title: str) -> None:
+    def _show(filename: str, title: str, expanded: bool = True) -> None:
         path = os.path.join(plot_dir, f"{filename}.png")
         if os.path.exists(path):
-            st.subheader(title)
-            st.image(path, width="stretch")
+            with st.expander(title, expanded=expanded):
+                st.image(path, width="stretch")
 
     _show("bias2",             "Bias²")
     _show("variance",          "Std Dev across Replications")
     _show("f_variance",        "Std(f(x)) across Replications")
-    _show("mean_explanations", "Mean Explanations")
+    _show("mean_feature_exps",        "Mean Feature Explanations (ALE vs SHAP)")
+    _show("mean_function_additivity", "Mean Function Value and Additivity")
+
+    with st.expander("Additivity Residual", expanded=True):
+        add_fig, add_info = _plot_additivity_hist(view)
+        if add_fig is not None:
+            st.pyplot(add_fig)
+            st.caption(
+                "Residual = sum_d φ_d(x) − (f(x) − E[f(X)]). "
+                "Shapley efficiency ⇒ residual ≈ 0. "
+                + "  ".join(f"{m} RMSE = {v:.4f}" for m, v in add_info.items())
+            )
+        else:
+            st.caption(
+                "Additivity histogram unavailable: this cached results pickle "
+                "predates `f_means`. Rerun `python run_experiments.py <config>` "
+                "to backfill."
+            )
 
     d = int(results["explain_grid"].shape[1])
     if d == 2:
-        st.divider()
-        _render_interactive_section(cache_dir, config_name, results_file, row)
+        with st.expander("Interactive Mode", expanded=False):
+            _render_interactive_section(cache_dir, config_name, results_file, row)
+        with st.expander("Path Integral Interactive Mode", expanded=False):
+            _render_path_integral_section(cache_dir, config_name, results_file, row)
+        with st.expander("Multi-Path Interactive Mode", expanded=False):
+            _render_multi_path_section(cache_dir, config_name, results_file, row)
     else:
-        st.divider()
-        st.info(f"Interactive mode is only available for d=2 experiments (this one has d={d}).")
+        st.caption(f"Interactive mode is only available for d=2 experiments (this one has d={d}).")
 
     if d > 2:
-        st.divider()
-        st.header("ALE Paths Summary")
-        feat_opts = list(range(1, d + 1))
-        pcols = st.columns(2)
-        with pcols[0]:
-            i_sel = st.selectbox(
-                "Feature i", options=feat_opts, index=0,
-                key=f"paths_i_{selected_key}_{ale_tag}",
-            )
-        with pcols[1]:
-            j_opts = [j for j in feat_opts if j != i_sel]
-            j_sel = st.selectbox(
-                "Feature j", options=j_opts, index=0,
-                key=f"paths_j_{selected_key}_{ale_tag}_{i_sel}",
-            )
+        with st.expander("ALE Paths Summary", expanded=False):
+            feat_opts = list(range(d))
+            pcols = st.columns(2)
+            with pcols[0]:
+                i_sel = st.selectbox(
+                    "Feature i", options=feat_opts, index=0,
+                    key=f"paths_i_{selected_key}_{ale_tag}",
+                )
+            with pcols[1]:
+                j_opts = [j for j in feat_opts if j != i_sel]
+                j_sel = st.selectbox(
+                    "Feature j", options=j_opts, index=0,
+                    key=f"paths_j_{selected_key}_{ale_tag}_{i_sel}",
+                )
 
-        with st.spinner("Building ALE for paths summary…"):
-            ale_ps = _build_paths_ale(cache_dir, config_name, results_file, ale_tag)
-        if ale_ps is None:
-            st.warning("Could not build paths summary ALE (missing config or run_*.pkl).")
-        else:
-            with st.spinner(f"Rendering pair f{i_sel} → f{j_sel}…"):
-                fig, _ = ale_ps.plot_paths_summary(int(i_sel), int(j_sel), cmap="viridis")
-            st.subheader(f"Feature {i_sel} → Feature {j_sel}")
-            st.pyplot(fig)
+            with st.spinner("Building ALE for paths summary…"):
+                ale_ps = _build_paths_ale(cache_dir, config_name, results_file, ale_tag)
+            if ale_ps is None:
+                st.warning("Could not build paths summary ALE (missing config or run_*.pkl).")
+            else:
+                with st.spinner(f"Rendering pair f{i_sel} → f{j_sel}…"):
+                    fig, _ = plot_paths_summary(ale_ps, int(i_sel), int(j_sel), cmap="viridis")
+                st.markdown(f"**Feature {i_sel} → Feature {j_sel}**")
+                st.pyplot(fig)
 
 
 # ---------------------------------------------------------------------------

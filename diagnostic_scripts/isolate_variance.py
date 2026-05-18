@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import signal_basic, signal_basic_explanation, sample_X_gaussian
 from experiments import DGP, Experiment, ExplainerConfig
 from ale import ALE
-from ale.ale_vim import _ale_total_vim
+from ale.vim import compute_total_vim as _ale_total_vim
 from ale.shared import calculate_edges, calculate_K, calculate_bins, calculate_deltas
 from shapley import SHAP
 
@@ -68,8 +68,7 @@ def experiment_4_cumsum_amplification(rho=0.0):
     data_and_models = experiment.fit_models(rng)
 
     # For each feature, collect deltas_by_path and g_values across replications
-    for feature_idx in [1, 2]:  # 1-based
-        idx = feature_idx - 1
+    for idx in [0, 1]:  # 0-based
         all_deltas_by_path = []  # (R, K_actual, L)
         all_g_values = []        # (R, K_actual, L)
 
@@ -81,9 +80,9 @@ def experiment_4_cumsum_amplification(rho=0.0):
                 total_vim, forest, paths, g_values,
                 centered_g_values, l_x, deltas, k_x,
             ) = _ale_total_vim(
-                f, X, feature_idx, K, L, categorical, {},
+                f, X, idx, K, L, categorical, {},
                 method="connected", interpolate=True, centering="y",
-                edges=None, knn_smooth=None,
+                edges=None,
             )
 
             # Recover deltas_by_path from g_values (g_values = cumsum of deltas_by_path)
@@ -113,7 +112,7 @@ def experiment_4_cumsum_amplification(rho=0.0):
         axes[0].plot(range(min_K), gval_var_by_bin, 'r-o', markersize=3, label='G-value variance')
         axes[0].set_xlabel('Bin index k')
         axes[0].set_ylabel('Variance across replications')
-        axes[0].set_title(f'Feature {feature_idx} (rho={rho})')
+        axes[0].set_title(f'Feature {idx} (rho={rho})')
         axes[0].legend()
         axes[0].set_yscale('log')
 
@@ -121,16 +120,16 @@ def experiment_4_cumsum_amplification(rho=0.0):
                      'g-o', markersize=3)
         axes[1].set_xlabel('Bin index k')
         axes[1].set_ylabel('G-value var / Delta var')
-        axes[1].set_title(f'Amplification ratio (feature {feature_idx})')
+        axes[1].set_title(f'Amplification ratio (feature {idx})')
 
         fig.suptitle(f'Experiment 4: Cumsum Amplification (K={K}, L={L}, rho={rho})')
         fig.tight_layout()
-        fig.savefig(os.path.join(OUTPUT_DIR, f'exp4_cumsum_rho{rho}_f{feature_idx}.png'), dpi=150)
+        fig.savefig(os.path.join(OUTPUT_DIR, f'exp4_cumsum_rho{rho}_f{idx}.png'), dpi=150)
         plt.close(fig)
 
-        print(f"  Feature {feature_idx}: delta_var range [{delta_var_by_bin.min():.6f}, {delta_var_by_bin.max():.6f}]")
-        print(f"  Feature {feature_idx}: gval_var  range [{gval_var_by_bin.min():.6f}, {gval_var_by_bin.max():.6f}]")
-        print(f"  Feature {feature_idx}: amplification ratio at last bin = {gval_var_by_bin[-1] / max(delta_var_by_bin[-1], 1e-12):.1f}x")
+        print(f"  Feature {idx}: delta_var range [{delta_var_by_bin.min():.6f}, {delta_var_by_bin.max():.6f}]")
+        print(f"  Feature {idx}: gval_var  range [{gval_var_by_bin.min():.6f}, {gval_var_by_bin.max():.6f}]")
+        print(f"  Feature {idx}: amplification ratio at last bin = {gval_var_by_bin[-1] / max(delta_var_by_bin[-1], 1e-12):.1f}x")
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """
 Local-method comparison config: signal_basic across full RHO sweep.
 
-Compares the three explain_local variants ("interpolate", "path_rep", "self")
+Compares the explain_local variants ("path_rep", "multi_path_interpolate")
 on the same fitted ALE so the only thing that varies is how the local effect
 is computed.
 """
@@ -14,6 +14,7 @@ from models import (
     signal_threshold, signal_threshold_explanation,
     signal_cubic,     signal_cubic_explanation,
     signal_abs,       signal_abs_explanation,
+    signal_basic_interaction, signal_basic_interaction_explanation
 )
 from experiments import ExplainerConfig, ShapConfig
 
@@ -26,14 +27,15 @@ SIGNALS = [
     (signal_threshold, signal_threshold_explanation, None),  # discontinuous at x1=0
     (signal_cubic,     signal_cubic_explanation,     None),  # high curvature
     (signal_abs,       signal_abs_explanation,       None),  # non-differentiable kink
+    (signal_basic_interaction, signal_basic_interaction_explanation, None),  # interaction with no main effects
 ]
 
 SNRS = [9]
 NS = [1000]
-RHOS = [0, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99]
+RHOS = [0, 0.3, 0.5, 0.7, 0.9, 0.95]
 
 SAMPLERS = [
-    ("gaussian", lambda rho: sample_X_gaussian(cov=[[1, rho], [rho, 1]])),
+    ("uniform", lambda rho: sample_X_gaussian(cov=[[1, rho], [rho, 1]])),
 ]
 
 MODEL_TYPES = [
@@ -41,10 +43,8 @@ MODEL_TYPES = [
 ]
 
 ALE_CONFIGS = [
-    ExplainerConfig(K=40, L=25, local_method="interpolate", tag="K40_L25_interpolate"),
     ExplainerConfig(K=40, L=25, local_method="path_rep",    tag="K40_L25_path_rep"),
-    ExplainerConfig(K=40, L=25, local_method="self",        tag="K40_L25_self"),
-    ExplainerConfig(K=40, L=25, local_method="path_integral", background_size=100, background_seed=42, boundary_interp=True, tag="K40_L25_path_integral"),
+    ExplainerConfig(K=40, L=25, local_method="multi_path_interpolate",   tag="K40_L25_multi_path_interpolate", background_size=1000, background_seed=42, boundary_interp=False)
 ]
 
 SHAP_CONFIGS = [

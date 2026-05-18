@@ -105,35 +105,6 @@ def bin_selection(n):
     return nice
 
 
-def generalized_distance(x, X, categorical, std_devs, ignored_variables=None, multipliers=None):
-    """
-    Compute generalized distance between a point x and each row in X.
-
-    Parameters:
-        x: a 1-D numpy array of shape (d,)
-        X: a 2-D numpy array of shape (n, d)
-        categorical: a list of booleans indicating if each feature is categorical
-        std_devs: a 1-D numpy array of shape (d,) containing standard deviations for continuous features
-        ignored_variables: a list of indices to ignore in the distance calculation
-
-    Returns:
-        A 1-D numpy array of shape (n,) containing the distances.
-    """
-    # std_devs is only used for continuous features
-    n, d = X.shape
-    dist = np.zeros(n)
-    multipliers = np.ones(d) if multipliers is None else multipliers
-
-    for i in range(d):
-        if ignored_variables and i in ignored_variables:
-            continue
-        if categorical[i]:
-            dist += (X[:, i] != x[i]).astype(int) * multipliers[i]
-        else:
-            dist += (X[:, i] - x[i]) ** 2 / (std_devs[i] ** 2) * multipliers[i]
-
-    return np.sqrt(dist)
-
 def kernel_weighting(distances, bandwidth):
     """
     Apply kernel weighting to the distances.

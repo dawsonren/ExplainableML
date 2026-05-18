@@ -98,17 +98,15 @@ class ExplainerConfig:
     L: int = 10
     centering: str = "y"
     interpolate: bool = True
-    knn_smooth: Optional[int] = None
-    levels_up: int = 0
-    edges: Optional[dict] = None  # dict mapping 1-based feature index -> edges array
+    edges: Optional[dict] = None  # dict mapping 0-based feature index -> edges array
     variant: str = "standard"     # "standard" or "bootstrap"
     n_bootstrap: int = 50         # bootstrap replications (variant="bootstrap" only)
-    local_method: str = "interpolate"  # "interpolate", "path_rep", "self", or "path_integral"
+    local_method: str = "path_rep"  # "path_rep", "path_integral", or "multi_path_interpolate"
     method: str = "connected"     # path-generation method: "connected", "quantile", "random"
     random_seed: int = 42         # seed for method="random" path partitioning
-    background_size: Optional[int] = None  # path_integral only: size of background subsample (None = full X)
-    background_seed: Optional[int] = None  # path_integral only: RNG seed for the subsample (None = use random_seed)
-    boundary_interp: bool = False  # path_integral only: replace boundary f-evals with linear-interp of routed deltas
+    background_size: Optional[int] = None  # path_integral / multi_path_interpolate only: size of background subsample (None = full X)
+    background_seed: Optional[int] = None  # path_integral / multi_path_interpolate only: RNG seed for the subsample (None = use random_seed)
+    boundary_interp: bool = False  # path_integral only (ignored by multi_path_interpolate): replace boundary f-evals with linear-interp of routed deltas
     tag: Optional[str] = None     # human-readable filename label; auto-generated if None
 
     @property
@@ -118,11 +116,8 @@ class ExplainerConfig:
             base += "_quant"
         elif self.method == "random":
             base += f"_rand_s{self.random_seed}"
-        if self.levels_up != 0:
-            base += f"_lu{self.levels_up}"
-        if self.local_method != "interpolate":
-            base += f"_{self.local_method}"
-        if self.local_method == "path_integral" and self.background_size is not None:
+        base += f"_{self.local_method}"
+        if self.local_method in ("path_integral", "multi_path_interpolate") and self.background_size is not None:
             base += f"_bg{self.background_size}"
         if self.local_method == "path_integral" and self.boundary_interp:
             base += "_binterp"
@@ -139,8 +134,6 @@ class ExplainerConfig:
             "L": self.L,
             "centering": self.centering,
             "interpolate": self.interpolate,
-            "knn_smooth": self.knn_smooth,
-            "levels_up": self.levels_up,
             "edges": str(self.edges),
             "variant": self.variant,
             "n_bootstrap": self.n_bootstrap,
@@ -214,6 +207,7 @@ def load_results(experiment: "Experiment", cache_dir: str) -> dict:
         },
         "explain_grid": None,
         "f_vals": None,
+        "f_means": None,
         "ale": {},
         "shap": {},
     }
@@ -254,7 +248,6 @@ def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.
                 K=ec.K, L=ec.L,
                 centering=ec.centering,
                 interpolate=ec.interpolate,
-                knn_smooth=ec.knn_smooth,
                 random_seed=ec.random_seed,
                 verbose=False,
             )
@@ -265,7 +258,6 @@ def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.
                 K=ec.K, L=ec.L,
                 centering=ec.centering,
                 interpolate=ec.interpolate,
-                knn_smooth=ec.knn_smooth,
                 edges=ec.edges,
                 random_seed=ec.random_seed,
                 verbose=False,
@@ -281,7 +273,6 @@ def compute_ale(experiment: "Experiment", ec: ExplainerConfig, explain_grid: np.
         else:
             exp_r = ale.explain_local(
                 explain_grid,
-                levels_up=ec.levels_up,
                 local_method=ec.local_method,
                 background_size=ec.background_size,
                 background_seed=ec.background_seed,
@@ -349,6 +340,45 @@ def compute_f_vals(experiment: "Experiment", explain_grid: np.ndarray,
     return np.asarray([model.predict(explain_grid) for _, _, model in runs])
 
 
+def compute_f_means(experiment: "Experiment", cache_dir: str,
+                    seed: int = 42) -> np.ndarray:
+    """E[f(X)] per replication, taken over each replication's training X. Shape (R,)."""
+    rng = np.random.default_rng(seed)
+    runs = experiment.fit_models(rng, cache_dir)[: experiment.replications]
+    return np.asarray([float(model.predict(X).mean()) for X, _, model in runs])
+
+
+def compute_r2(experiment: "Experiment", cache_dir: str,
+               n_test: int = 5000, seed: int = 12345) -> dict:
+    """
+    Per-replication fit diagnostics, each shape (R,):
+      r2_train        : R² of model on its training (X, y_noisy)
+      r2_test_noisy   : R² on a fresh (X', y'_noisy) draw — ceiling is 1 - 1/(1+snr)
+      r2_test_signal  : R² on a fresh X' against the noiseless signal f(X') — ceiling is 1
+      gap             : r2_train - r2_test_noisy
+    """
+    from sklearn.metrics import r2_score
+    runs = experiment.fit_models(np.random.default_rng(seed), cache_dir)[: experiment.replications]
+    rng = np.random.default_rng(seed + 1)
+    r2_train, r2_test_noisy, r2_test_signal = [], [], []
+    for X_tr, y_tr, model in runs:
+        r2_train.append(float(r2_score(y_tr, model.predict(X_tr))))
+        X_te, y_te = experiment.dgp.sample(n=n_test, rng=rng)
+        y_te_signal = experiment.dgp.signal(X_te)
+        preds = model.predict(X_te)
+        r2_test_noisy.append(float(r2_score(y_te, preds)))
+        r2_test_signal.append(float(r2_score(y_te_signal, preds)))
+    r2_train = np.asarray(r2_train)
+    r2_test_noisy = np.asarray(r2_test_noisy)
+    r2_test_signal = np.asarray(r2_test_signal)
+    return {
+        "r2_train": r2_train,
+        "r2_test_noisy": r2_test_noisy,
+        "r2_test_signal": r2_test_signal,
+        "gap": r2_train - r2_test_noisy,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Bias/variance (computed on demand from stored explanations)
 # ---------------------------------------------------------------------------
@@ -366,3 +396,27 @@ def compute_bias_variance(exps: np.ndarray, true_explanation: Optional[np.ndarra
     else:
         bias2 = ((exps.mean(axis=0) - true_explanation) ** 2).mean(axis=0)
     return {"bias2": np.asarray(bias2), "stddev": np.asarray(stddev)}
+
+
+def compute_additivity(exps: np.ndarray, f_vals: Optional[np.ndarray],
+                       f_means: Optional[np.ndarray]) -> dict:
+    """
+    Test the Shapley efficiency property: sum_d phi_d(x) == f(x) - E[f(X)].
+
+    `exps`    : (R, n_grid, d) attributions.
+    `f_vals`  : (R, n_grid) model predictions on the explain grid.
+    `f_means` : (R,) E[f(X)] per replication (mean over training X).
+
+    Returns RMSE of the residual over (R, n_grid), plus a normalized
+    version (RMSE / std of the target f(x) - E[f(X)]) and the mean abs
+    residual. NaN if f_vals or f_means is missing.
+    """
+    if f_vals is None or f_means is None:
+        return {"rmse": np.nan, "rmse_norm": np.nan, "mean_abs": np.nan}
+    target = f_vals - f_means[:, None]            # (R, n_grid)
+    residual = exps.sum(axis=-1) - target         # (R, n_grid)
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
+    target_std = float(target.std())
+    rmse_norm = rmse / target_std if target_std > 0 else np.nan
+    mean_abs = float(np.mean(np.abs(residual)))
+    return {"rmse": rmse, "rmse_norm": rmse_norm, "mean_abs": mean_abs}

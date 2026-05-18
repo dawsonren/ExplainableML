@@ -13,7 +13,7 @@ from experiments import (
     DGP, Experiment,
     ExplainerConfig, ShapConfig,
     load_results, save_results,
-    compute_ale, compute_shap, compute_f_vals,
+    compute_ale, compute_shap, compute_f_vals, compute_f_means,
 )
 
 
@@ -98,6 +98,12 @@ def run_experiment(experiment: Experiment, explain_grid: np.ndarray,
         if pbar is not None:
             pbar.set_description(f"{base_desc} [f_vals]")
         results["f_vals"] = compute_f_vals(experiment, explain_grid, cache_dir)
+        dirty = True
+
+    if results.get("f_means") is None:
+        if pbar is not None:
+            pbar.set_description(f"{base_desc} [f_means]")
+        results["f_means"] = compute_f_means(experiment, cache_dir)
         dirty = True
 
     # ALE configs

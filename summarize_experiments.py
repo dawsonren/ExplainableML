@@ -31,28 +31,8 @@ from textual.widgets import DataTable, Footer, Header
 from textual.reactive import reactive
 
 import models
-from experiments import compute_bias_variance
-
-
-# ---------------------------------------------------------------------------
-# True-explanation lookup
-# ---------------------------------------------------------------------------
-
-def _true_explanation_fn(signal_name: str):
-    """Return the *_explanation function for a signal name, if it exists and is rho-independent."""
-    fn = getattr(models, f"{signal_name}_explanation", None)
-    if fn is None:
-        return None
-    # rho-dependent explanations (e.g. signal_multiplicative) take two args; we
-    # cannot evaluate them here without knowing rho. Skip them.
-    try:
-        import inspect
-        nparams = len(inspect.signature(fn).parameters)
-    except (TypeError, ValueError):
-        return None
-    if nparams != 1:
-        return None
-    return fn
+from experiments import compute_bias_variance, compute_additivity
+from experiments_io import true_explanation_fn as _true_explanation_fn
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +87,7 @@ def _rows_from_results(results: dict, config_name: str, subdir: str,
 
     # f(x) stddev across replications, averaged over grid points
     f_vals = results.get("f_vals")
+    f_means = results.get("f_means")
     f_stddev = float(f_vals.std(axis=0).mean()) if f_vals is not None else np.nan
 
     rows = []
@@ -115,12 +96,14 @@ def _rows_from_results(results: dict, config_name: str, subdir: str,
         ale_times = ale_entry.get("times")
         ec = ale_entry.get("config")
         ale_bv = compute_bias_variance(ale_exps, true_exp)
+        ale_add = compute_additivity(ale_exps, f_vals, f_means)
 
         for shap_tag, shap_entry in shap_store.items():
             shap_exps = shap_entry["exps"]
             shap_times = shap_entry.get("times")
             sc = shap_entry.get("config")
             shap_bv = compute_bias_variance(shap_exps, true_exp)
+            shap_add = compute_additivity(shap_exps, f_vals, f_means)
 
             d = ale_exps.shape[-1]
             row = {
@@ -134,10 +117,9 @@ def _rows_from_results(results: dict, config_name: str, subdir: str,
                 "K":           getattr(ec, "K", None),
                 "L":           getattr(ec, "L", None),
                 "centering":   getattr(ec, "centering", None),
-                "levels_up":   getattr(ec, "levels_up", None),
                 "variant":     getattr(ec, "variant", None),
                 "n_bootstrap": getattr(ec, "n_bootstrap", 0),
-                "local_method": getattr(ec, "local_method", "interpolate"),
+                "local_method": getattr(ec, "local_method", "path_rep"),
                 "ale_tag":     ale_tag,
                 "shap_tag":    shap_tag,
                 "shap_method":        getattr(sc, "method", None),
@@ -147,6 +129,12 @@ def _rows_from_results(results: dict, config_name: str, subdir: str,
                 "shap_time_mean":  float(shap_times.mean()) if shap_times is not None else np.nan,
                 "dim":             d,
                 "f_stddev":        f_stddev,
+                "ale_additivity_rmse":       ale_add["rmse"],
+                "ale_additivity_rmse_norm":  ale_add["rmse_norm"],
+                "ale_additivity_mean_abs":   ale_add["mean_abs"],
+                "shap_additivity_rmse":      shap_add["rmse"],
+                "shap_additivity_rmse_norm": shap_add["rmse_norm"],
+                "shap_additivity_mean_abs":  shap_add["mean_abs"],
                 "_results_file":   results_file,
                 **tune,
             }
@@ -202,7 +190,6 @@ _BASE_COLS = [
     ("L",            "L"),
     ("Variant",      "variant"),
     ("LocalMethod",  "local_method"),
-    ("LevelsUp",     "levels_up"),
     ("ALE Tag",      "ale_tag"),
     ("SHAP Tag",     "shap_tag"),
     ("SHAP Method",  "shap_method"),
@@ -217,6 +204,10 @@ _TAIL_COLS = [
     ("ALE time/pt",  "ale_time_mean"),
     ("Std(f)",       "f_stddev"),
     ("StdRed%",      "rel_stddev_reduction"),
+    ("ALE Add RMSE",  "ale_additivity_rmse"),
+    ("ALE Add %",     "ale_additivity_rmse_norm"),
+    ("SHAP Add RMSE", "shap_additivity_rmse"),
+    ("SHAP Add %",    "shap_additivity_rmse_norm"),
 ]
 
 
@@ -240,6 +231,10 @@ def _fmt_cell(v, key):
         return f"{v:.6f}"
     if key.startswith("rel_stddev_reduction"):
         return f"{v:+.1%}"
+    if key.endswith("_additivity_rmse_norm"):
+        return f"{v:.2%}"
+    if key.endswith(("_additivity_rmse", "_additivity_mean_abs")):
+        return f"{v:.4f}"
     if key in ("ale_time_mean", "shap_time_mean"):
         return f"{v:.4f}s"
     if key == "rho":

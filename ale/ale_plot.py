@@ -10,11 +10,10 @@ from ale.shared import (
 )
 
 
-def _ale_1d(f, X, feature_idx, bins, categorical=False):
+def _ale_1d(f, X, idx, bins, categorical=False):
     """
-    Assumes X is a numpy array.
+    Assumes X is a numpy array. `idx` is 0-based.
     """
-    idx = feature_idx - 1  # convert to 0-based index
     x = X[:, idx]
     n = len(x)
 
@@ -23,7 +22,7 @@ def _ale_1d(f, X, feature_idx, bins, categorical=False):
     k_x, N_k = calculate_bins(x, edges, categorical)
 
     # calculate per-observation ALE values
-    deltas = calculate_deltas(f, X, idx, edges, k_x)
+    deltas = calculate_deltas(f, X, idx, edges, k_x, categorical=categorical)
 
     average_deltas = np.zeros(K)
     # average deltas for each bin
@@ -50,7 +49,7 @@ def _ale_1d(f, X, feature_idx, bins, categorical=False):
 
 
 def _ale_2d(
-    f, X, feature_idx_1, feature_idx_2, bins, categorical_1=False, categorical_2=False
+    f, X, idx_1, idx_2, bins, categorical_1=False, categorical_2=False
 ):
     """
     Compute centered 2-D ALE values that visualizes the effects
@@ -59,8 +58,8 @@ def _ale_2d(
     Inputs:
     - f: the model function, takes a 1D array of shape (p,)
     - X: numpy array of shape (n, p)
-    - feature_idx_1: 1-based index of the first feature
-    - feature_idx_2: 1-based index of the second feature
+    - idx_1: 0-based index of the first feature
+    - idx_2: 0-based index of the second feature
     - bins: number of bins for ALE calculation
 
     Returns:
@@ -68,8 +67,6 @@ def _ale_2d(
     - points_2: x_l values for the second feature
     - curve: ALE curve values at bin midpoints
     """
-    idx_1 = feature_idx_1 - 1  # convert to 0-based index
-    idx_2 = feature_idx_2 - 1  # convert to 0-based index
     x1 = X[:, idx_1]
     x2 = X[:, idx_2]
     n = len(x1)

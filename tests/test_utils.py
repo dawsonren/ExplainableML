@@ -12,7 +12,7 @@ from ale.shared import (
     calculate_deltas,
     linear_interpolation,
 )
-from ale.ale_vim import GValues, calculate_g_values, observation_to_path
+from ale.vim import GValues, calculate_g_values, observation_to_path
 from ale.tree_partitioning import generate_connected_kdforest_and_paths
 from ale import ALE
 
@@ -115,15 +115,16 @@ class TestDeltas(unittest.TestCase):
         ])
         f = lambda X: X[:, 0] + X[:, 1] ** 2
         K = 3
-        # Last category in each feature has no right edge, so delta=0
+        # Categorical uses left-difference: bin 0 (first category) has no
+        # predecessor and gets delta=0; bin k >= 1 gets f(cat_k) - f(cat_{k-1}).
         true_deltas = np.array([
-            [1, 1, 1, 1, 1, 1, 0, 0, 0],
-            [3, 5, 0, 3, 5, 0, 3, 5, 0],
+            [0, 0, 0, 1, 1, 1, 1, 1, 1],
+            [0, 3, 5, 0, 3, 5, 0, 3, 5],
         ])
         for idx in range(2):
             edges = calculate_edges(X[:, idx], K, categorical=True)
             k_x = calculate_bin_index(X[:, idx], edges, K, categorical=True)
-            deltas = calculate_deltas(f, X, idx, edges, k_x)
+            deltas = calculate_deltas(f, X, idx, edges, k_x, categorical=True)
             np.testing.assert_array_equal(deltas, true_deltas[idx])
 
     def test_calculate_deltas_continuous(self):
@@ -155,7 +156,7 @@ class TestDeltas(unittest.TestCase):
             deltas = calculate_deltas(f, X, idx, edges, k_x)
             np.testing.assert_array_equal(deltas, true_deltas[idx])
             g_values, _, _ = calculate_g_values(
-                "connected", X, idx + 1, edges, deltas, [False, False], {}, 3, 3, k_x
+                "connected", X, idx, edges, deltas, [False, False], {}, 3, 3, k_x
             )
             for l in range(3):
                 np.testing.assert_array_equal(g_values[:, l], true_g_values[idx])
@@ -359,11 +360,11 @@ class TestALEEndToEnd(unittest.TestCase):
 
     def test_main_vim_detects_important_feature(self):
         ale = ALE(self.f_linear, self.X, K=self.K, verbose=False)
+        vim_x0 = ale.ale_main_vim(0)
         vim_x1 = ale.ale_main_vim(1)
-        vim_x2 = ale.ale_main_vim(2)
-        # X1 is the only relevant feature
-        self.assertGreater(vim_x1, 0.1)
-        self.assertAlmostEqual(vim_x2, 0.0, places=5)
+        # X[:, 0] is the only relevant feature
+        self.assertGreater(vim_x0, 0.1)
+        self.assertAlmostEqual(vim_x1, 0.0, places=5)
 
     def test_explain_returns_dataframe(self):
         ale = ALE(self.f_linear, self.X, K=self.K, verbose=False)
@@ -385,16 +386,16 @@ class TestALEEndToEnd(unittest.TestCase):
 
     def test_total_connected_vim_nonzero_for_relevant_feature(self):
         ale = ALE(self.f_linear, self.X, K=self.K, verbose=False)
-        vim = ale.ale_total_vim(1, method="connected")
+        vim = ale.ale_total_vim(0, method="connected")
         self.assertGreater(vim, 0.1)
 
     def test_additive_signal_both_features_detected(self):
         f = lambda X: X[:, 0] + X[:, 1] ** 2
         ale = ALE(f, self.X, K=self.K, verbose=False)
+        vim_x0 = ale.ale_main_vim(0)
         vim_x1 = ale.ale_main_vim(1)
-        vim_x2 = ale.ale_main_vim(2)
+        self.assertGreater(vim_x0, 0.01)
         self.assertGreater(vim_x1, 0.01)
-        self.assertGreater(vim_x2, 0.01)
 
 
 if __name__ == "__main__":
